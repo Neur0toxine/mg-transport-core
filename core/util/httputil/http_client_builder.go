@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -24,28 +25,29 @@ var DefaultTransport = http.DefaultTransport
 
 // HTTPClientBuilder builds http client with mocks (if necessary) and timeout.
 // Example:
-// 		// Build HTTP client with timeout = 10 sec, without SSL certificates verification and with mocked google.com
-// 		client, err := NewHTTPClientBuilder().
-// 			SetTimeout(10).
-// 			SetMockAddress("api_mock:3004").
-// 			AddMockedDomain("google.com").
-// 			SetSSLVerification(false).
-// 			Build()
 //
-// 		if err != nil {
-// 			fmt.Print(err)
-// 		}
+//	// Build HTTP client with timeout = 10 sec, without SSL certificates verification and with mocked google.com
+//	client, err := NewHTTPClientBuilder().
+//		SetTimeout(10).
+//		SetMockAddress("api_mock:3004").
+//		AddMockedDomain("google.com").
+//		SetSSLVerification(false).
+//		Build()
 //
-// 		// Actual response will be returned from "api_mock:3004" (it should provide any ssl certificate)
-// 		if resp, err := client.Get("https://google.com"); err == nil {
-// 			if data, err := ioutil.ReadAll(resp.Body); err == nil {
-// 				fmt.Printf("Data: %s", string(data))
-// 			} else {
-// 				fmt.Print(err)
-// 			}
-// 		} else {
-// 			fmt.Print(err)
-// 		}
+//	if err != nil {
+//		fmt.Print(err)
+//	}
+//
+//	// Actual response will be returned from "api_mock:3004" (it should provide any ssl certificate)
+//	if resp, err := client.Get("https://google.com"); err == nil {
+//		if data, err := ioutil.ReadAll(resp.Body); err == nil {
+//			fmt.Printf("Data: %s", string(data))
+//		} else {
+//			fmt.Print(err)
+//		}
+//	} else {
+//		fmt.Print(err)
+//	}
 type HTTPClientBuilder struct {
 	logger        logger.Logger
 	httpClient    *http.Client
@@ -205,11 +207,11 @@ func (b *HTTPClientBuilder) buildMocks() error {
 	}
 
 	if b.mockHost != "" && b.mockPort != "" && len(b.mockedDomains) > 0 {
-		b.logf("Mock address is \"%s\"\n", net.JoinHostPort(b.mockHost, b.mockPort))
-		b.logf("Mocked domains: ")
+		b.log("Mock address has been set", slog.String("address", net.JoinHostPort(b.mockHost, b.mockPort)))
+		b.log("Mocked domains: ")
 
 		for _, domain := range b.mockedDomains {
-			b.logf(" - %s\n", domain)
+			b.log(fmt.Sprintf(" - %s\n", domain))
 		}
 
 		b.httpTransport.DialContext = func(ctx context.Context, network, addr string) (conn net.Conn, e error) {
@@ -232,7 +234,7 @@ func (b *HTTPClientBuilder) buildMocks() error {
 						addr = net.JoinHostPort(b.mockHost, b.mockPort)
 					}
 
-					b.logf("Mocking \"%s\" with \"%s\"\n", oldAddr, addr)
+					b.log(fmt.Sprintf("Mocking \"%s\" with \"%s\"\n", oldAddr, addr))
 				}
 			}
 
@@ -243,13 +245,13 @@ func (b *HTTPClientBuilder) buildMocks() error {
 	return nil
 }
 
-// logf prints logs via Engine or via fmt.Printf.
-func (b *HTTPClientBuilder) logf(format string, args ...interface{}) {
+// log prints logs via Engine or via fmt.Println.
+func (b *HTTPClientBuilder) log(msg string, args ...interface{}) {
 	if b.logging {
 		if b.logger != nil {
-			b.logger.Infof(format, args...)
+			b.logger.Info(msg, args...)
 		} else {
-			fmt.Printf(format, args...)
+			fmt.Println(append([]any{msg}, args...))
 		}
 	}
 }
