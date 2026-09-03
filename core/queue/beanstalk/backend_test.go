@@ -61,7 +61,9 @@ func (m *fakeManager) Release(id uint64, _ uint32, delay time.Duration) error {
 	time.AfterFunc(delay, func() { m.ready <- id })
 	return nil
 }
-func (m *fakeManager) Touch(uint64) error { return nil }
+func (m *fakeManager) Touch(uint64) error {
+	return nil
+}
 func (m *fakeManager) Attempts(id uint64) (uint64, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -72,19 +74,24 @@ func (m *fakeManager) Stats() (TubeStats, error) {
 	defer m.mu.Unlock()
 	return TubeStats{Ready: int64(len(m.ready)), Reserved: m.reserved}, nil
 }
-func (m *fakeManager) Close() error { return nil }
+func (m *fakeManager) Close() error {
+	return nil
+}
 
 type timeoutError struct{}
 
-func (timeoutError) Error() string { return "timeout" }
+func (timeoutError) Error() string {
+	return "timeout"
+}
 
 func TestBackend(t *testing.T) {
 	backend := New(newFakeManager(), queue.JSONCodec[string]{}, Options{PollTimeout: time.Millisecond})
 	q := queue.New(1, backend)
-	require.NoError(t, q.Enqueue(t.Context(), "job"))
+	require.NoError(t, q.Enqueue(t.Context(), "job", queue.WithID("transport-message-id")))
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "job", delivery.Value())
+	assert.Equal(t, "transport-message-id", delivery.Metadata().ID)
 	assert.Equal(t, uint64(1), delivery.Metadata().Attempt)
 	require.NoError(t, delivery.Requeue(t.Context(), 0))
 	delivery, err = q.Dequeue(t.Context())

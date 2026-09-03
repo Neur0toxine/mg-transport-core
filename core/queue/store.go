@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -11,214 +12,270 @@ const drainPollInterval = 10 * time.Millisecond
 
 type BackendConstructor[T any] func(context.Context, int) (Backend[T], error)
 
-type Info struct {
-	ID              int
-	LastEnqueueTime time.Time
-	Stats           Stats
+type StoreOption[T any] func(*Store[T])
+
+func WithPanicHandler[T any](handler PanicHandler[T]) StoreOption[T] {
+	return func(store *Store[T]) { store.panicHandler = handler }
 }
 
-type ScaleFunc func(Info, func(), func(), func() (slotsLeft, slotsActive int))
+func WithUnsettledProcessor[T any](processor UnsettledProcessor[T]) StoreOption[T] {
+	return func(store *Store[T]) { store.unsettled = processor }
+}
 
-type queueState[T any] struct {
-	queue         *Queue[T]
-	workerCancels []context.CancelFunc
-	scaleCancel   context.CancelFunc
+func WithWorkerFactory[T any](factory WorkerFactory[T]) StoreOption[T] {
+	return func(store *Store[T]) { store.workerFactory = factory }
+}
+
+type storeEntry[T any] struct {
+	ready    chan struct{}
+	executor *Executor[T]
+	err      error
+	removed  bool
 }
 
 type Store[T any] struct {
-	mu                 sync.Mutex
-	queues             map[int]*queueState[T]
+	mu                 sync.RWMutex
+	executors          map[int]*storeEntry[T]
 	backendConstructor BackendConstructor[T]
-	workerConstructor  WorkerConstructor[T]
-	numWorkers         int
-	maxNumWorkers      int
-	scaleFunc          ScaleFunc
-	scaleInterval      time.Duration
+	processor          Processor[T]
+	policy             WorkerPolicy
+	panicHandler       PanicHandler[T]
+	unsettled          UnsettledProcessor[T]
+	workerFactory      WorkerFactory[T]
+	closing            []*storeEntry[T]
+	stopped            bool
 	intakeClosed       bool
 }
 
-func NewStore[T any](constructor BackendConstructor[T]) *Store[T] {
-	return &Store[T]{backendConstructor: constructor, queues: make(map[int]*queueState[T]), numWorkers: 1, maxNumWorkers: 1}
-}
-
-func (s *Store[T]) WithWorkerConstructor(constructor WorkerConstructor[T]) *Store[T] {
-	s.workerConstructor = constructor
-	return s
-}
-
-func (s *Store[T]) WithNumWorkers(count int) *Store[T] {
-	s.numWorkers = max(1, count)
-	s.maxNumWorkers = max(s.maxNumWorkers, s.numWorkers)
-	return s
-}
-
-func (s *Store[T]) WithMaxNumWorkers(count int) *Store[T] {
-	s.maxNumWorkers = max(s.numWorkers, count)
-	return s
-}
-
-func (s *Store[T]) WithScaleFunc(function ScaleFunc, interval time.Duration) *Store[T] {
-	s.mu.Lock()
-	s.scaleFunc, s.scaleInterval = function, interval
-	states := make([]*queueState[T], 0, len(s.queues))
-	for _, state := range s.queues {
-		states = append(states, state)
+func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], policy WorkerPolicy,
+	options ...StoreOption[T],
+) (*Store[T], error) {
+	if constructor == nil {
+		return nil, errors.New("backend constructor is required")
 	}
-	s.mu.Unlock()
-	for _, state := range states {
-		go s.startScaler(state)
+	if processor == nil {
+		return nil, errors.New("processor is required")
 	}
-	return s
-}
-
-func (s *Store[T]) Get(ctx context.Context, id int) (*Queue[T], error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if state := s.queues[id]; state != nil {
-		return state.queue, nil
-	}
-	backend, err := s.backendConstructor(ctx, id)
-	if err != nil {
+	if err := policy.validate(); err != nil {
 		return nil, err
 	}
-	q := New(id, backend)
-	if s.intakeClosed {
-		q.CloseIntake()
+	store := &Store[T]{
+		executors: make(map[int]*storeEntry[T]), backendConstructor: constructor,
+		processor: processor, policy: policy, workerFactory: defaultWorkerFactory[T],
 	}
-	state := &queueState[T]{queue: q}
-	s.queues[id] = state
-	s.startWorkersLocked(state, id, s.numWorkers)
-	go s.startScaler(state)
-	return q, nil
+	for _, option := range options {
+		option(store)
+	}
+	if store.workerFactory == nil {
+		return nil, errors.New("worker factory is required")
+	}
+	return store, nil
 }
 
-func (s *Store[T]) startWorkersLocked(state *queueState[T], id, count int) {
-	if s.workerConstructor == nil {
-		return
-	}
-	for range count {
-		ctx, cancel := context.WithCancel(state.queue.Context())
-		state.workerCancels = append(state.workerCancels, cancel)
-		go s.workerConstructor(ctx, id)(state.queue)
-	}
-}
-
-func (s *Store[T]) startScaler(state *queueState[T]) {
-	s.mu.Lock()
-	if state.scaleCancel != nil {
-		state.scaleCancel()
-	}
-	function, interval := s.scaleFunc, s.scaleInterval
-	if function == nil || interval <= 0 {
-		s.mu.Unlock()
-		return
-	}
-	ctx, cancel := context.WithCancel(state.queue.Context())
-	state.scaleCancel = cancel
-	s.mu.Unlock()
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+func (s *Store[T]) Get(ctx context.Context, id int) (*Executor[T], error) {
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			stats, err := state.queue.Stats(ctx)
-			if err != nil {
-				continue
+		s.mu.Lock()
+		if s.stopped {
+			s.mu.Unlock()
+			return nil, context.Canceled
+		}
+		if entry := s.executors[id]; entry != nil {
+			s.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-entry.ready:
+				s.mu.RLock()
+				defer s.mu.RUnlock()
+				if entry.removed {
+					return nil, context.Canceled
+				}
+				return entry.executor, entry.err
 			}
-			invokeScaleFunc(function, Info{ID: state.queue.ID(), LastEnqueueTime: state.queue.LastEnqueueTime(), Stats: stats},
-				func() { s.addWorker(state.queue.ID()) }, func() { s.stopWorker(state.queue.ID()) },
-				func() (int, int) { return s.scalingInfo(state.queue.ID()) })
+		}
+		entry := &storeEntry[T]{ready: make(chan struct{})}
+		s.executors[id] = entry
+		s.mu.Unlock()
+
+		backend, err := s.backendConstructor(ctx, id)
+		if err != nil {
+			s.finishConstruction(id, entry, nil, err)
+			return nil, err
+		}
+		if backend == nil {
+			err = errors.New("backend constructor returned nil backend")
+			s.finishConstruction(id, entry, nil, err)
+			return nil, err
+		}
+		executor := newExecutor(id, backend, s.processor, s.policy, s.panicHandler, s.unsettled, s.workerFactory)
+		if err := s.finishConstruction(id, entry, executor, nil); err != nil {
+			_ = executor.shutdown(context.WithoutCancel(ctx))
+			return nil, err
+		}
+		return executor, nil
+	}
+}
+
+func (s *Store[T]) finishConstruction(id int, entry *storeEntry[T], executor *Executor[T], constructionErr error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if constructionErr != nil {
+		entry.err = constructionErr
+		if s.executors[id] == entry {
+			delete(s.executors, id)
+		}
+		close(entry.ready)
+		return constructionErr
+	}
+	if s.stopped || entry.removed || s.executors[id] != entry {
+		entry.err = context.Canceled
+		entry.executor = executor
+		close(entry.ready)
+		return context.Canceled
+	}
+	if s.intakeClosed {
+		executor.CloseIntake()
+	}
+	entry.executor = executor
+	close(entry.ready)
+	return nil
+}
+
+func (s *Store[T]) Enqueue(ctx context.Context, id int, value T, options ...EnqueueOption) error {
+	executor, err := s.Get(ctx, id)
+	if err != nil {
+		return err
+	}
+	return executor.Enqueue(ctx, value, options...)
+}
+
+func (s *Store[T]) Info(ctx context.Context, id int) (ExecutorInfo, bool, error) {
+	s.mu.RLock()
+	entry := s.executors[id]
+	s.mu.RUnlock()
+	if entry == nil {
+		return ExecutorInfo{}, false, nil
+	}
+	select {
+	case <-ctx.Done():
+		return ExecutorInfo{}, false, ctx.Err()
+	case <-entry.ready:
+	}
+	s.mu.RLock()
+	executor, entryErr, removed := entry.executor, entry.err, entry.removed
+	s.mu.RUnlock()
+	if entryErr != nil || executor == nil || removed {
+		return ExecutorInfo{}, false, entryErr
+	}
+	info, err := executor.Info(ctx)
+	return info, true, err
+}
+
+func (s *Store[T]) Has(id int) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.executors[id] != nil
+}
+
+func (s *Store[T]) Reconcile(ctx context.Context, ids []int) error {
+	desired := make(map[int]struct{}, len(ids))
+	var errs []error
+	for _, id := range ids {
+		if _, exists := desired[id]; exists {
+			continue
+		}
+		desired[id] = struct{}{}
+		if _, err := s.Get(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("create queue %d: %w", id, err))
 		}
 	}
-}
-
-func invokeScaleFunc(function ScaleFunc, info Info, addWorker, stopWorker func(), scalingInfo func() (int, int)) {
-	defer func() { _ = recover() }()
-	function(info, addWorker, stopWorker, scalingInfo)
-}
-
-func (s *Store[T]) addWorker(id int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state := s.queues[id]
-	if state == nil || len(state.workerCancels) >= s.maxNumWorkers {
-		return
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
-	s.startWorkersLocked(state, id, 1)
-}
 
-func (s *Store[T]) stopWorker(id int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state := s.queues[id]
-	if state == nil || len(state.workerCancels) <= 1 {
-		return
+	s.mu.RLock()
+	stale := make([]int, 0, len(s.executors))
+	for id := range s.executors {
+		if _, keep := desired[id]; !keep {
+			stale = append(stale, id)
+		}
 	}
-	last := len(state.workerCancels) - 1
-	state.workerCancels[last]()
-	state.workerCancels = state.workerCancels[:last]
-}
-
-func (s *Store[T]) scalingInfo(id int) (int, int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	state := s.queues[id]
-	if state == nil {
-		return s.maxNumWorkers, 0
+	s.mu.RUnlock()
+	for _, id := range stale {
+		if err := s.Remove(ctx, id); err != nil {
+			errs = append(errs, fmt.Errorf("remove queue %d: %w", id, err))
+		}
 	}
-	active := len(state.workerCancels)
-	return max(0, s.maxNumWorkers-active), active
+	return errors.Join(errs...)
 }
 
 func (s *Store[T]) Remove(ctx context.Context, id int) error {
 	s.mu.Lock()
-	state := s.queues[id]
-	delete(s.queues, id)
+	entry := s.executors[id]
+	if entry != nil {
+		entry.removed = true
+		delete(s.executors, id)
+	}
 	s.mu.Unlock()
-	if state == nil {
+	if entry == nil {
 		return nil
 	}
-	if state.scaleCancel != nil {
-		state.scaleCancel()
+	select {
+	case <-entry.ready:
+	default:
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-entry.ready:
+		}
 	}
-	for _, cancel := range state.workerCancels {
-		cancel()
+	if entry.executor == nil {
+		return entry.err
 	}
-	return state.queue.Close(ctx)
+	return entry.executor.Close(ctx)
 }
 
 func (s *Store[T]) CloseIntake() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.intakeClosed = true
-	for _, state := range s.queues {
-		state.queue.CloseIntake()
+	executors := s.readyExecutorsLocked()
+	s.mu.Unlock()
+	for _, executor := range executors {
+		executor.CloseIntake()
 	}
 }
 
 func (s *Store[T]) Stats(ctx context.Context) (Stats, error) {
-	s.mu.Lock()
-	queues := make([]*Queue[T], 0, len(s.queues))
-	for _, state := range s.queues {
-		queues = append(queues, state.queue)
+	s.mu.RLock()
+	entries := make([]*storeEntry[T], 0, len(s.executors))
+	for _, entry := range s.executors {
+		entries = append(entries, entry)
 	}
-	s.mu.Unlock()
-	var result Stats
+	s.mu.RUnlock()
+	var total Stats
 	var errs []error
-	for _, q := range queues {
-		stats, err := q.Stats(ctx)
+	for _, entry := range entries {
+		select {
+		case <-ctx.Done():
+			return total, errors.Join(append(errs, ctx.Err())...)
+		case <-entry.ready:
+		}
+		s.mu.RLock()
+		executor, entryErr, removed := entry.executor, entry.err, entry.removed
+		s.mu.RUnlock()
+		if executor == nil || entryErr != nil || removed {
+			continue
+		}
+		info, err := executor.Info(ctx)
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		result.Ready += stats.Ready
-		result.Deferred += stats.Deferred
-		result.InFlight += stats.InFlight
+		total.Ready += info.Stats.Ready
+		total.Deferred += info.Stats.Deferred
+		total.InFlight += info.Stats.InFlight
 	}
-	return result, errors.Join(errs...)
+	return total, errors.Join(errs...)
 }
 
 func (s *Store[T]) Drain(ctx context.Context) error {
@@ -242,14 +299,53 @@ func (s *Store[T]) Drain(ctx context.Context) error {
 
 func (s *Store[T]) Stop(ctx context.Context) error {
 	s.mu.Lock()
-	ids := make([]int, 0, len(s.queues))
-	for id := range s.queues {
-		ids = append(ids, id)
+	if !s.stopped {
+		s.stopped = true
+		s.closing = make([]*storeEntry[T], 0, len(s.executors))
+		for _, entry := range s.executors {
+			entry.removed = true
+			s.closing = append(s.closing, entry)
+		}
+		clear(s.executors)
 	}
+	entries := append([]*storeEntry[T](nil), s.closing...)
 	s.mu.Unlock()
+
 	var errs []error
-	for _, id := range ids {
-		errs = append(errs, s.Remove(ctx, id))
+	for _, entry := range entries {
+		select {
+		case <-entry.ready:
+		default:
+			select {
+			case <-ctx.Done():
+				return errors.Join(append(errs, ctx.Err())...)
+			case <-entry.ready:
+			}
+		}
+		if entry.executor != nil {
+			errs = append(errs, entry.executor.Close(ctx))
+		}
 	}
-	return errors.Join(errs...)
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	clear(s.closing)
+	s.closing = nil
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Store[T]) readyExecutorsLocked() []*Executor[T] {
+	executors := make([]*Executor[T], 0, len(s.executors))
+	for _, entry := range s.executors {
+		select {
+		case <-entry.ready:
+			if entry.executor != nil && entry.err == nil {
+				executors = append(executors, entry.executor)
+			}
+		default:
+		}
+	}
+	return executors
 }

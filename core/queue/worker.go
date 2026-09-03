@@ -1,11 +1,13 @@
 package queue
 
-import "context"
+import (
+	"context"
+	"errors"
+	"time"
+)
 
-type Worker[T any] func(*Queue[T])
-type WorkerConstructor[T any] func(context.Context, int) Worker[T]
-type Processor[T any] func(context.Context, Delivery[T])
-type PanicHandler[T any] func(context.Context, Delivery[T], any)
+type Processor[T any] func(context.Context, int, Delivery[T])
+type PanicHandler[T any] func(context.Context, int, Delivery[T], any)
 
 type UnsettledKind uint8
 
@@ -19,79 +21,80 @@ type UnsettledCause struct {
 	Panic any
 }
 
-type UnsettledProcessor[T any] func(context.Context, Delivery[T], UnsettledCause)
+type UnsettledProcessor[T any] func(context.Context, int, Delivery[T], UnsettledCause)
 
-type workerOptions[T any] struct {
-	panicHandler       PanicHandler[T]
-	unsettledProcessor UnsettledProcessor[T]
-	cancelCallbacks    []func()
+type WorkerResult uint8
+
+const (
+	WorkerIdle WorkerResult = iota
+	WorkerStopped
+)
+
+// Worker consumes deliveries until it becomes idle or cannot continue.
+type Worker interface {
+	Run(context.Context) WorkerResult
 }
 
-type WorkerOption[T any] func(*workerOptions[T])
-
-func WithPanicHandler[T any](handler PanicHandler[T]) WorkerOption[T] {
-	return func(options *workerOptions[T]) { options.panicHandler = handler }
+type WorkerConfig[T any] struct {
+	Queue              *Queue[T]
+	Processor          Processor[T]
+	PanicHandler       PanicHandler[T]
+	UnsettledProcessor UnsettledProcessor[T]
+	IdleTimeout        time.Duration
 }
 
-func WithUnsettledProcessor[T any](processor UnsettledProcessor[T]) WorkerOption[T] {
-	return func(options *workerOptions[T]) { options.unsettledProcessor = processor }
+type WorkerFactory[T any] func(WorkerConfig[T]) Worker
+
+type defaultWorker[T any] struct {
+	config WorkerConfig[T]
 }
 
-func WithCancelCallbacks[T any](callbacks ...func()) WorkerOption[T] {
-	return func(options *workerOptions[T]) {
-		options.cancelCallbacks = append(options.cancelCallbacks, callbacks...)
+func defaultWorkerFactory[T any](config WorkerConfig[T]) Worker {
+	return &defaultWorker[T]{config: config}
+}
+
+func (w *defaultWorker[T]) Run(ctx context.Context) WorkerResult {
+	for {
+		dequeueCtx, cancel := context.WithTimeout(ctx, w.config.IdleTimeout)
+		delivery, err := w.config.Queue.Dequeue(dequeueCtx)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			return WorkerIdle
+		}
+		if err != nil {
+			return WorkerStopped
+		}
+		w.process(ctx, delivery)
 	}
 }
 
-func NewWorker[T any](ctx context.Context, processor Processor[T], options ...WorkerOption[T]) Worker[T] {
-	configuration := workerOptions[T]{}
-	for _, option := range options {
-		option(&configuration)
-	}
-
-	return func(q *Queue[T]) {
+func (w *defaultWorker[T]) process(ctx context.Context, delivery Delivery[T]) {
+	cause := UnsettledCause{Kind: UnsettledReturned}
+	func() {
 		defer func() {
-			for _, callback := range configuration.cancelCallbacks {
-				callback()
+			if recovered := recover(); recovered != nil {
+				cause = UnsettledCause{Kind: UnsettledPanicked, Panic: recovered}
+				callPanicHandler(w.config.PanicHandler, ctx, w.config.Queue.ID(), delivery, recovered)
 			}
 		}()
-		for {
-			delivery, err := q.Dequeue(ctx)
-			if err != nil {
-				return
-			}
-			cause := UnsettledCause{Kind: UnsettledReturned}
-			func() {
-				defer func() {
-					if recovered := recover(); recovered != nil {
-						cause = UnsettledCause{Kind: UnsettledPanicked, Panic: recovered}
-						callPanicHandler(configuration.panicHandler, ctx, delivery, recovered)
-					}
-				}()
-				processor(ctx, delivery)
+		w.config.Processor(ctx, w.config.Queue.ID(), delivery)
+	}()
+	if !delivery.Settled() && w.config.UnsettledProcessor != nil {
+		func() {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					callPanicHandler(w.config.PanicHandler, ctx, w.config.Queue.ID(), delivery, recovered)
+				}
 			}()
-			if !delivery.Settled() && configuration.unsettledProcessor != nil {
-				func() {
-					defer func() {
-						if recovered := recover(); recovered != nil {
-							callPanicHandler(configuration.panicHandler, ctx, delivery, recovered)
-						}
-					}()
-					configuration.unsettledProcessor(ctx, delivery, cause)
-				}()
-			}
-		}
+			w.config.UnsettledProcessor(ctx, w.config.Queue.ID(), delivery, cause)
+		}()
 	}
 }
 
-func callPanicHandler[T any](handler PanicHandler[T], ctx context.Context, delivery Delivery[T], recovered any) {
+func callPanicHandler[T any](handler PanicHandler[T], ctx context.Context, id int, delivery Delivery[T], recovered any) {
 	if handler == nil {
 		return
 	}
 	defer func() { _ = recover() }()
-	handler(ctx, delivery, recovered)
-}
-
-func DummyWorker[T any]() WorkerConstructor[T] {
-	return func(context.Context, int) Worker[T] { return func(*Queue[T]) {} }
+	handler(ctx, id, delivery, recovered)
 }

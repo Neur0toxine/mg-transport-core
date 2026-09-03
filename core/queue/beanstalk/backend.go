@@ -50,7 +50,11 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 		return fmt.Errorf("encode beanstalk delivery: %w", err)
 	}
 	now := time.Now()
-	body, err := json.Marshal(envelope{ID: fmt.Sprintf("beanstalk-%d", now.UnixNano()), EnqueuedAt: now, Payload: payload})
+	id := options.ID
+	if id == "" {
+		id = fmt.Sprintf("beanstalk-%d", now.UnixNano())
+	}
+	body, err := json.Marshal(envelope{ID: id, EnqueuedAt: now, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("encode beanstalk envelope: %w", err)
 	}
@@ -97,7 +101,10 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	stats, err := b.manager.Stats()
 	return queue.Stats{Ready: stats.Ready, Deferred: stats.Delayed, InFlight: stats.Reserved}, err
 }
-func (b *Backend[T]) Close(context.Context) error { b.closed.Store(true); return b.manager.Close() }
+func (b *Backend[T]) Close(context.Context) error {
+	b.closed.Store(true)
+	return b.manager.Close()
+}
 
 type delivery[T any] struct {
 	backend  *Backend[T]
@@ -107,9 +114,17 @@ type delivery[T any] struct {
 	settled  atomic.Bool
 }
 
-func (d *delivery[T]) Value() T                 { return d.value }
-func (d *delivery[T]) Metadata() queue.Metadata { return d.metadata }
-func (d *delivery[T]) Settled() bool            { return d.settled.Load() }
+func (d *delivery[T]) Value() T {
+	return d.value
+}
+
+func (d *delivery[T]) Metadata() queue.Metadata {
+	return d.metadata
+}
+
+func (d *delivery[T]) Settled() bool {
+	return d.settled.Load()
+}
 func (d *delivery[T]) terminal(operation func() error) error {
 	if !d.settled.CompareAndSwap(false, true) {
 		return queue.ErrDeliverySettled
@@ -123,7 +138,9 @@ func (d *delivery[T]) terminal(operation func() error) error {
 func (d *delivery[T]) Ack(context.Context) error {
 	return d.terminal(func() error { return d.backend.manager.Delete(d.jobID) })
 }
-func (d *delivery[T]) Reject(ctx context.Context) error { return d.Ack(ctx) }
+func (d *delivery[T]) Reject(ctx context.Context) error {
+	return d.Ack(ctx)
+}
 func (d *delivery[T]) Requeue(ctx context.Context, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err

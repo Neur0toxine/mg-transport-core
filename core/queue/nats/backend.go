@@ -149,7 +149,10 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 		return fmt.Errorf("encode NATS delivery: %w", err)
 	}
 	now := time.Now()
-	id := uuid.New().String()
+	id := options.ID
+	if id == "" {
+		id = uuid.New().String()
+	}
 	body, err := json.Marshal(envelope{ID: id, EnqueuedAt: now, Payload: payload})
 	if err != nil {
 		return fmt.Errorf("encode NATS envelope: %w", err)
@@ -157,7 +160,8 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 	message := &natsgo.Msg{Subject: b.config.Subject, Data: body, Header: natsgo.Header{jetstream.MsgIDHeader: []string{id}}}
 	publishOptions := []jetstream.PublishOpt{jetstream.WithMsgID(id)}
 	if options.NotBefore.After(now) {
-		message.Subject = b.config.ScheduleSubject + "." + strings.ReplaceAll(id, "-", "")
+		scheduleToken := strings.ReplaceAll(uuid.New().String(), "-", "")
+		message.Subject = b.config.ScheduleSubject + "." + scheduleToken
 		publishOptions = append(publishOptions, jetstream.WithScheduleAt(options.NotBefore), jetstream.WithScheduleTarget(b.config.Subject))
 	}
 	if _, err := b.js.PublishMsg(ctx, message, publishOptions...); err != nil {
@@ -216,7 +220,10 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	return queue.Stats{Ready: int64(info.NumPending), Deferred: int64(deferred), InFlight: int64(info.NumAckPending)}, nil
 }
 
-func (b *Backend[T]) Close(context.Context) error { b.closed.Store(true); return nil }
+func (b *Backend[T]) Close(context.Context) error {
+	b.closed.Store(true)
+	return nil
+}
 
 type delivery[T any] struct {
 	message  jetstream.Msg
@@ -225,9 +232,17 @@ type delivery[T any] struct {
 	settled  atomic.Bool
 }
 
-func (d *delivery[T]) Value() T                 { return d.value }
-func (d *delivery[T]) Metadata() queue.Metadata { return d.metadata }
-func (d *delivery[T]) Settled() bool            { return d.settled.Load() }
+func (d *delivery[T]) Value() T {
+	return d.value
+}
+
+func (d *delivery[T]) Metadata() queue.Metadata {
+	return d.metadata
+}
+
+func (d *delivery[T]) Settled() bool {
+	return d.settled.Load()
+}
 func (d *delivery[T]) terminal(operation func() error) error {
 	if !d.settled.CompareAndSwap(false, true) {
 		return queue.ErrDeliverySettled

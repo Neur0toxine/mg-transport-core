@@ -15,7 +15,7 @@ import (
 func TestQueueDeliveryLifecycle(t *testing.T) {
 	backend := memory.New[int](memory.Options{AckWait: 50 * time.Millisecond})
 	q := queue.New(7, backend)
-	require.NoError(t, q.Enqueue(t.Context(), 1))
+	require.NoError(t, q.Enqueue(t.Context(), 1, queue.WithID("caller-id")))
 	require.NoError(t, q.Enqueue(t.Context(), 2, queue.WithDelay(30*time.Millisecond)))
 
 	stats, err := q.Stats(t.Context())
@@ -25,6 +25,7 @@ func TestQueueDeliveryLifecycle(t *testing.T) {
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, 1, delivery.Value())
+	assert.Equal(t, "caller-id", delivery.Metadata().ID)
 	assert.Equal(t, uint64(1), delivery.Metadata().Attempt)
 	require.NoError(t, delivery.Requeue(t.Context(), 0))
 	require.ErrorIs(t, delivery.Ack(t.Context()), queue.ErrDeliverySettled)
@@ -60,27 +61,36 @@ func TestMemoryRedeliversExpiredDelivery(t *testing.T) {
 }
 
 func TestWorkerUsesUnsettledProcessor(t *testing.T) {
-	q := queue.New(1, memory.New[int](memory.Options{}))
 	var called atomic.Int64
-	worker := queue.NewWorker(t.Context(), func(context.Context, queue.Delivery[int]) {},
-		queue.WithUnsettledProcessor(func(ctx context.Context, delivery queue.Delivery[int], cause queue.UnsettledCause) {
+	store, err := queue.NewStore(
+		func(context.Context, int) (queue.Backend[int], error) {
+			return memory.New[int](memory.Options{}), nil
+		},
+		func(context.Context, int, queue.Delivery[int]) {},
+		queue.WorkerPolicy{MinWorkers: 1, MaxWorkers: 1, JobsPerWorker: 1, IdleTimeout: time.Second, ScaleInterval: time.Second},
+		queue.WithUnsettledProcessor(func(ctx context.Context, _ int, delivery queue.Delivery[int], cause queue.UnsettledCause) {
 			called.Add(1)
 			assert.Equal(t, queue.UnsettledReturned, cause.Kind)
 			require.NoError(t, delivery.Ack(ctx))
-		}))
-	go worker(q)
-	require.NoError(t, q.Enqueue(t.Context(), 42))
+		}),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Stop(context.Background())) })
+	require.NoError(t, store.Enqueue(t.Context(), 1, 42))
 	require.Eventually(t, func() bool { return called.Load() == 1 }, time.Second, time.Millisecond)
 }
 
 func TestStoreConstructsAndDrainsQueues(t *testing.T) {
-	store := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
-		return memory.New[int](memory.Options{}), nil
-	}).WithWorkerConstructor(func(ctx context.Context, _ int) queue.Worker[int] {
-		return queue.NewWorker(ctx, func(ctx context.Context, delivery queue.Delivery[int]) {
+	store, err := queue.NewStore(
+		func(context.Context, int) (queue.Backend[int], error) {
+			return memory.New[int](memory.Options{}), nil
+		},
+		func(ctx context.Context, _ int, delivery queue.Delivery[int]) {
 			require.NoError(t, delivery.Ack(ctx))
-		})
-	})
+		},
+		queue.WorkerPolicy{MinWorkers: 1, MaxWorkers: 1, JobsPerWorker: 1, IdleTimeout: time.Second, ScaleInterval: time.Second},
+	)
+	require.NoError(t, err)
 	q, err := store.Get(t.Context(), 5)
 	require.NoError(t, err)
 	require.NoError(t, q.Enqueue(t.Context(), 1))

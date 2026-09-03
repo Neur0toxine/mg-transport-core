@@ -24,6 +24,7 @@ require (
 	github.com/h2non/gock v1.2.0
 	github.com/jessevdk/go-flags v1.6.1
 	github.com/jinzhu/gorm v1.9.11
+	github.com/maypok86/otter/v2 v2.3.0
 	github.com/nats-io/nats-server/v2 v2.14.3
 	github.com/nats-io/nats.go v1.53.1
 	github.com/nicksnyder/go-i18n/v2 v2.4.1
@@ -31,7 +32,7 @@ require (
 	github.com/retailcrm/api-client-go/v2 v2.1.17
 	github.com/retailcrm/mg-transport-api-client-go v1.3.23
 	github.com/retailcrm/zabbix-metrics-collector v1.0.0
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	go.uber.org/atomic v1.11.0
 	go.uber.org/zap v1.27.0
 	golang.org/x/text v0.38.0

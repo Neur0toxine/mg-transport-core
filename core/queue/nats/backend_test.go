@@ -32,8 +32,9 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	})
 	require.NoError(t, err)
 	q := queue.New(1, backend)
-	require.NoError(t, q.Enqueue(t.Context(), "now"))
-	require.NoError(t, q.Enqueue(t.Context(), "later", queue.WithDelay(100*time.Millisecond)))
+	require.NoError(t, q.Enqueue(t.Context(), "now", queue.WithID("transport-message-id")))
+	require.NoError(t, q.Enqueue(t.Context(), "later", queue.WithID("scheduled id with spaces"),
+		queue.WithDelay(100*time.Millisecond)))
 	require.Eventually(t, func() bool {
 		stats, statsErr := q.Stats(t.Context())
 		return statsErr == nil && stats.Deferred == 1
@@ -42,6 +43,7 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "now", delivery.Value())
+	assert.Equal(t, "transport-message-id", delivery.Metadata().ID)
 	require.NoError(t, delivery.Requeue(t.Context(), 20*time.Millisecond))
 	delivery, err = q.Dequeue(t.Context())
 	require.NoError(t, err)
@@ -52,6 +54,7 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	delivery, err = q.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "later", delivery.Value())
+	assert.Equal(t, "scheduled id with spaces", delivery.Metadata().ID)
 	require.NoError(t, delivery.Reject(t.Context()))
 	require.NoError(t, backend.Close(t.Context()))
 

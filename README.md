@@ -152,21 +152,77 @@ Currently, it only can generate new migrations for your transport.
 `queue.JSONCodec[T]` uses Go's JSON v2 implementation.
 
 ```go
-backend := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
-jobs := queue.New(1, backend)
-
-if err := jobs.Enqueue(ctx, job, queue.WithDelay(time.Minute)); err != nil {
-    return err
-}
-
-delivery, err := jobs.Dequeue(ctx)
+jobs, err := queue.NewStore(
+    func(context.Context, int) (queue.Backend[Job], error) {
+        return memory.New[Job](memory.Options{AckWait: 30 * time.Second}), nil
+    },
+    func(ctx context.Context, accountID int, delivery queue.Delivery[Job]) {
+        if err := handle(ctx, accountID, delivery.Value()); err != nil {
+            _ = delivery.Requeue(ctx, time.Second)
+            return
+        }
+        _ = delivery.Ack(ctx)
+    },
+    queue.WorkerPolicy{
+        MinWorkers: 1, MaxWorkers: 10, JobsPerWorker: 10,
+        IdleTimeout: time.Minute, ScaleInterval: time.Second,
+    },
+)
 if err != nil {
     return err
 }
-return delivery.Ack(ctx)
+if err := jobs.Enqueue(ctx, accountID, job, queue.WithID(job.ID), queue.WithDelay(time.Minute)); err != nil {
+    return err
+}
+return jobs.Stop(ctx)
 ```
 
 Deliveries must be explicitly acknowledged, requeued, or rejected. `Touch` renews the backend acknowledgment lease.
-An unsettled worker delivery remains pending unless `queue.WithUnsettledProcessor` is configured. The NATS backend
+An unsettled worker delivery remains pending unless `queue.WithUnsettledProcessor` is configured. A store owns one
+executor per numeric queue ID; each executor owns its backend, worker group, scaling controller, and lifecycle. Scaling
+reacts to local enqueues and periodically checks backend statistics, so persisted or remotely published work is also
+discovered. `Store.Reconcile` can keep the executor set aligned with active transport accounts. The NATS backend
 uses a durable JetStream pull consumer and requires message schedules. Its `Ensure` mode can create or update the
 stream and consumer; `BindExisting` only validates pre-provisioned resources.
+
+Use `queue.FuncCodec` when persisted values need runtime-only dependencies restored after decoding. The backend
+constructor receives the queue ID, so a transport can bind the decoder and NATS subject to the same account:
+
+```go
+codec := queue.FuncCodec[*Task]{
+    EncodeFunc: queue.JSONCodec[*Task]{}.Encode,
+    DecodeFunc: func(data []byte) (*Task, error) {
+        task, err := queue.JSONCodec[*Task]{}.Decode(data)
+        if err == nil {
+            err = hydrateTask(accountID, task)
+        }
+        return task, err
+    },
+}
+```
+
+### Cache backends
+
+`core/cache` provides a typed cache adapter with interchangeable in-memory and NATS JetStream KV backends. Cache
+entries use a fixed backend-wide TTL. Persistent values and non-string keys are encoded explicitly, allowing a
+transport-specific cache to switch storage without changing its domain-facing API.
+
+```go
+backend, err := memory.New[int, Account](memory.Options{
+    Capacity: 1_000,
+    TTL:      time.Hour,
+})
+if err != nil {
+    return err
+}
+accounts := cache.New(backend)
+
+if err := accounts.Set(ctx, account.ID, account); err != nil {
+    return err
+}
+account, found, err := accounts.Get(ctx, accountID)
+```
+
+The NATS backend accepts the shared `core/nats.Client`, a typed `cache.KeyEncoder`, a value `cache.Codec`, and a
+JetStream KV configuration. `Ensure` creates or updates the bucket, while `BindExisting` only binds to a bucket with
+the configured TTL. Closing a NATS cache does not close the shared client or delete the bucket.

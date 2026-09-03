@@ -16,6 +16,7 @@ type Options struct {
 }
 
 type item[T any] struct {
+	internalID string
 	id         string
 	value      T
 	enqueuedAt time.Time
@@ -26,10 +27,22 @@ type item[T any] struct {
 
 type delayedHeap[T any] []*item[T]
 
-func (h delayedHeap[T]) Len() int           { return len(h) }
-func (h delayedHeap[T]) Less(i, j int) bool { return h[i].notBefore.Before(h[j].notBefore) }
-func (h delayedHeap[T]) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].index, h[j].index = i, j }
-func (h *delayedHeap[T]) Push(value any)    { *h = append(*h, value.(*item[T])) }
+func (h delayedHeap[T]) Len() int {
+	return len(h)
+}
+
+func (h delayedHeap[T]) Less(i, j int) bool {
+	return h[i].notBefore.Before(h[j].notBefore)
+}
+
+func (h delayedHeap[T]) Swap(i, j int) {
+	h[i], h[j] = h[j], h[i]
+	h[i].index, h[j].index = i, j
+}
+
+func (h *delayedHeap[T]) Push(value any) {
+	*h = append(*h, value.(*item[T]))
+}
 func (h *delayedHeap[T]) Pop() any {
 	old := *h
 	last := old[len(old)-1]
@@ -71,7 +84,12 @@ func (b *Memory[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueO
 		return err
 	}
 	now := time.Now()
-	entry := &item[T]{id: fmt.Sprintf("memory-%d", b.sequence.Add(1)), value: value, enqueuedAt: now, notBefore: options.NotBefore}
+	internalID := fmt.Sprintf("memory-%d", b.sequence.Add(1))
+	id := options.ID
+	if id == "" {
+		id = internalID
+	}
+	entry := &item[T]{internalID: internalID, id: id, value: value, enqueuedAt: now, notBefore: options.NotBefore}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.closed {
@@ -116,7 +134,7 @@ func (b *Memory[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 				delivery.expire()
 			})
 			close(initialized)
-			b.inFlight[entry.id] = delivery
+			b.inFlight[entry.internalID] = delivery
 			b.mu.Unlock()
 			return delivery, nil
 		}
@@ -179,11 +197,15 @@ type memoryDelivery[T any] struct {
 	settled     atomic.Bool
 }
 
-func (d *memoryDelivery[T]) Value() T { return d.entry.value }
+func (d *memoryDelivery[T]) Value() T {
+	return d.entry.value
+}
 func (d *memoryDelivery[T]) Metadata() queue.Metadata {
 	return queue.Metadata{ID: d.entry.id, EnqueuedAt: d.entry.enqueuedAt, DeliveredAt: d.deliveredAt, Attempt: d.entry.attempt}
 }
-func (d *memoryDelivery[T]) Settled() bool { return d.settled.Load() }
+func (d *memoryDelivery[T]) Settled() bool {
+	return d.settled.Load()
+}
 
 func (d *memoryDelivery[T]) terminal(fn func()) error {
 	if !d.settled.CompareAndSwap(false, true) {
@@ -191,15 +213,20 @@ func (d *memoryDelivery[T]) terminal(fn func()) error {
 	}
 	d.timer.Stop()
 	d.backend.mu.Lock()
-	delete(d.backend.inFlight, d.entry.id)
+	delete(d.backend.inFlight, d.entry.internalID)
 	fn()
 	d.backend.mu.Unlock()
 	d.backend.signal()
 	return nil
 }
 
-func (d *memoryDelivery[T]) Ack(context.Context) error    { return d.terminal(func() {}) }
-func (d *memoryDelivery[T]) Reject(context.Context) error { return d.terminal(func() {}) }
+func (d *memoryDelivery[T]) Ack(context.Context) error {
+	return d.terminal(func() {})
+}
+
+func (d *memoryDelivery[T]) Reject(context.Context) error {
+	return d.terminal(func() {})
+}
 func (d *memoryDelivery[T]) Requeue(ctx context.Context, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err

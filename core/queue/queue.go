@@ -13,10 +13,15 @@ var (
 )
 
 type EnqueueOptions struct {
+	ID        string
 	NotBefore time.Time
 }
 
 type EnqueueOption func(*EnqueueOptions)
+
+func WithID(id string) EnqueueOption {
+	return func(options *EnqueueOptions) { options.ID = id }
+}
 
 func WithDelay(delay time.Duration) EnqueueOption {
 	return func(options *EnqueueOptions) { options.NotBefore = time.Now().Add(delay) }
@@ -57,7 +62,9 @@ type Stats struct {
 	InFlight int64
 }
 
-func (s Stats) Queued() int64 { return s.Ready + s.Deferred }
+func (s Stats) Queued() int64 {
+	return s.Ready + s.Deferred
+}
 
 type Backend[T any] interface {
 	Enqueue(context.Context, T, EnqueueOptions) error
@@ -76,6 +83,7 @@ type Queue[T any] struct {
 	intakeClosed bool
 	lastEnqueued time.Time
 	closeOnce    sync.Once
+	closeErr     error
 }
 
 func New[T any](id int, backend Backend[T]) *Queue[T] {
@@ -83,9 +91,13 @@ func New[T any](id int, backend Backend[T]) *Queue[T] {
 	return &Queue[T]{id: id, backend: backend, ctx: ctx, cancel: cancel}
 }
 
-func (q *Queue[T]) ID() int { return q.id }
+func (q *Queue[T]) ID() int {
+	return q.id
+}
 
-func (q *Queue[T]) Context() context.Context { return q.ctx }
+func (q *Queue[T]) Context() context.Context {
+	return q.ctx
+}
 
 func (q *Queue[T]) LastEnqueueTime() time.Time {
 	q.mu.RLock()
@@ -122,7 +134,9 @@ func (q *Queue[T]) Dequeue(ctx context.Context) (Delivery[T], error) {
 	return q.backend.Dequeue(ctx)
 }
 
-func (q *Queue[T]) Stats(ctx context.Context) (Stats, error) { return q.backend.Stats(ctx) }
+func (q *Queue[T]) Stats(ctx context.Context) (Stats, error) {
+	return q.backend.Stats(ctx)
+}
 
 func (q *Queue[T]) CloseIntake() {
 	q.mu.Lock()
@@ -130,10 +144,10 @@ func (q *Queue[T]) CloseIntake() {
 	q.mu.Unlock()
 }
 
-func (q *Queue[T]) Close(ctx context.Context) (err error) {
+func (q *Queue[T]) Close(ctx context.Context) error {
 	q.closeOnce.Do(func() {
 		q.cancel(context.Canceled)
-		err = q.backend.Close(ctx)
+		q.closeErr = q.backend.Close(ctx)
 	})
-	return err
+	return q.closeErr
 }
