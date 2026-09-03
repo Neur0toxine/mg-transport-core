@@ -1,88 +1,97 @@
 package queue
 
-import (
-	"context"
-	"errors"
+import "context"
+
+type Worker[T any] func(*Queue[T])
+type WorkerConstructor[T any] func(context.Context, int) Worker[T]
+type Processor[T any] func(context.Context, Delivery[T])
+type PanicHandler[T any] func(context.Context, Delivery[T], any)
+
+type UnsettledKind uint8
+
+const (
+	UnsettledReturned UnsettledKind = iota + 1
+	UnsettledPanicked
 )
 
-type (
-	// Worker represents function which dequeues an item from provided queue and does something with it.
-	// Useful when NewWorker implementation isn't agile enough.
-	// A custom Worker must call Queue.TaskDone after processing every successfully dequeued item.
-	Worker[T any]       func(Queue[T])
-	contextQueue[T any] interface {
-		DequeueContext(context.Context) (T, error)
+type UnsettledCause struct {
+	Kind  UnsettledKind
+	Panic any
+}
+
+type UnsettledProcessor[T any] func(context.Context, Delivery[T], UnsettledCause)
+
+type workerOptions[T any] struct {
+	panicHandler       PanicHandler[T]
+	unsettledProcessor UnsettledProcessor[T]
+	cancelCallbacks    []func()
+}
+
+type WorkerOption[T any] func(*workerOptions[T])
+
+func WithPanicHandler[T any](handler PanicHandler[T]) WorkerOption[T] {
+	return func(options *workerOptions[T]) { options.panicHandler = handler }
+}
+
+func WithUnsettledProcessor[T any](processor UnsettledProcessor[T]) WorkerOption[T] {
+	return func(options *workerOptions[T]) { options.unsettledProcessor = processor }
+}
+
+func WithCancelCallbacks[T any](callbacks ...func()) WorkerOption[T] {
+	return func(options *workerOptions[T]) {
+		options.cancelCallbacks = append(options.cancelCallbacks, callbacks...)
 	}
-	// Processor accepts incoming job and does something with it.
-	Processor[T any] func(T, Queue[T])
-	// RecoverFunc handles output value received from recover() call.
-	RecoverFunc[T any] func(context.Context, T, any)
-)
+}
 
-// NewWorker constructs new worker that will retry the given processor until it succeeds
-// or is interrupted by the context cancellation. `recover()` value in cause of panics is handled by provided recoverFn.
-func NewWorker[T any](
-	ctx context.Context,
-	processor Processor[T],
-	recoverFn RecoverFunc[T],
-	cancelCallbacks ...func(),
-) Worker[T] {
-	return func(q Queue[T]) {
-		callCancelCallbacks := func() {
-			for _, cb := range cancelCallbacks {
-				cb()
+func NewWorker[T any](ctx context.Context, processor Processor[T], options ...WorkerOption[T]) Worker[T] {
+	configuration := workerOptions[T]{}
+	for _, option := range options {
+		option(&configuration)
+	}
+
+	return func(q *Queue[T]) {
+		defer func() {
+			for _, callback := range configuration.cancelCallbacks {
+				callback()
 			}
-		}
-
-		dequeue := q.Dequeue
-		if contextQueue, ok := q.(contextQueue[T]); ok {
-			dequeue = func() (T, error) {
-				return contextQueue.DequeueContext(ctx)
-			}
-		}
-
+		}()
 		for {
-			if ctx.Err() != nil {
-				callCancelCallbacks()
-				return
-			}
-
-			job, err := dequeue()
+			delivery, err := q.Dequeue(ctx)
 			if err != nil {
-				if errors.Is(err, context.Canceled) || ctx.Err() != nil {
-					callCancelCallbacks()
-				}
 				return
 			}
-
-			(func() {
-				defer q.TaskDone()
+			cause := UnsettledCause{Kind: UnsettledReturned}
+			func() {
 				defer func() {
-					if r := recover(); r != nil {
-						recoverFn(q.Context(), job, r)
+					if recovered := recover(); recovered != nil {
+						cause = UnsettledCause{Kind: UnsettledPanicked, Panic: recovered}
+						callPanicHandler(configuration.panicHandler, ctx, delivery, recovered)
 					}
 				}()
-				processor(job, q)
-			})()
+				processor(ctx, delivery)
+			}()
+			if !delivery.Settled() && configuration.unsettledProcessor != nil {
+				func() {
+					defer func() {
+						if recovered := recover(); recovered != nil {
+							callPanicHandler(configuration.panicHandler, ctx, delivery, recovered)
+						}
+					}()
+					configuration.unsettledProcessor(ctx, delivery, cause)
+				}()
+			}
 		}
 	}
 }
 
-// DummyWorker worker constructor. Returns worker that does nothing.
-func DummyWorker[T any]() WorkerConstructor[T] {
-	return func(_ context.Context, _ int) Worker[T] {
-		return func(_ Queue[T]) {}
+func callPanicHandler[T any](handler PanicHandler[T], ctx context.Context, delivery Delivery[T], recovered any) {
+	if handler == nil {
+		return
 	}
+	defer func() { _ = recover() }()
+	handler(ctx, delivery, recovered)
 }
 
-// DummyProcessor does nothing with provided data.
-func DummyProcessor[T any](_ T, _ Queue[T]) {}
-
-// RecoverFuncDummy doesn't do anything with the result of `recover()` call.
-func RecoverFuncDummy[T any](_ context.Context, _ T, _ any) {}
-
-// Compile-time checks for interface compatibility.
-var (
-	_ = Processor[int](DummyProcessor[int])
-	_ = RecoverFunc[int](RecoverFuncDummy[int])
-)
+func DummyWorker[T any]() WorkerConstructor[T] {
+	return func(context.Context, int) Worker[T] { return func(*Queue[T]) {} }
+}

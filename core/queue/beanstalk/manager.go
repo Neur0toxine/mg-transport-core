@@ -1,92 +1,220 @@
 package beanstalk
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"net"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	gitBeanstalk "github.com/beanstalkd/go-beanstalk"
+	beanstalk "github.com/beanstalkd/go-beanstalk"
 	"github.com/retailcrm/mg-transport-core/v2/core/logger"
 	"go.uber.org/zap"
 )
 
-// Manager is a manager of interaction with Beanstalk.
+type TubeStats struct {
+	Ready    int64
+	Delayed  int64
+	Reserved int64
+}
+
+type ManagerInterface interface {
+	Put([]byte, uint32, time.Duration, time.Duration) (uint64, error)
+	Reserve(time.Duration) (uint64, []byte, error)
+	Delete(uint64) error
+	Release(uint64, uint32, time.Duration) error
+	Touch(uint64) error
+	Attempts(uint64) (uint64, error)
+	Stats() (TubeStats, error)
+	Close() error
+}
+
 type Manager struct {
-	addr           string
+	address        string
+	tubeName       string
 	log            logger.Logger
 	reconnectDelay time.Duration
-	tube           *gitBeanstalk.Tube
-	tubeSet        *gitBeanstalk.TubeSet
+	ctx            context.Context
+	cancel         context.CancelFunc
+	closed         atomic.Bool
+	sendMu         sync.Mutex
+	receiveMu      sync.Mutex
+	tube           *beanstalk.Tube
+	tubeSet        *beanstalk.TubeSet
 }
 
-// NewManager creates a new Manager with the specified address for connecting to beanstalk,
-// the logger and the reconnection delay.
-func NewManager(addr string, log logger.Logger, reconnectDelay time.Duration) Manager {
-	manager := Manager{
-		addr:           addr,
-		log:            log,
-		reconnectDelay: reconnectDelay,
+func NewManager(ctx context.Context, address, tube string, log logger.Logger, reconnectDelay time.Duration) (*Manager, error) {
+	if reconnectDelay <= 0 {
+		reconnectDelay = time.Second
 	}
-
-	return manager
+	if log == nil {
+		log = logger.NewNil()
+	}
+	runtimeCtx, cancel := context.WithCancel(context.Background())
+	manager := &Manager{address: address, tubeName: tube, log: log, reconnectDelay: reconnectDelay, ctx: runtimeCtx, cancel: cancel}
+	if err := manager.connect(ctx); err != nil {
+		return nil, err
+	}
+	return manager, nil
 }
 
-// getConnection returns a new connection to the beanstalk.
-func (m *Manager) getConnection() *gitBeanstalk.Conn {
+func (m *Manager) dial(ctx context.Context) (*beanstalk.Conn, error) {
 	for {
-		conn, err := gitBeanstalk.Dial("tcp", m.addr)
-		if err != nil {
-			m.log.Info(fmt.Sprintf("cannot connect to beanstalkd, retrying in %s",
-				m.reconnectDelay.String()),
-				zap.Error(err),
-			)
-			time.Sleep(m.reconnectDelay)
-			continue
+		conn, err := beanstalk.Dial("tcp", m.address)
+		if err == nil {
+			return conn, nil
 		}
-		return conn
+		m.log.Warn("cannot connect to beanstalkd", zap.Error(err))
+		timer := time.NewTimer(m.reconnectDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
 	}
 }
 
-// CreateTubes returns a new Tube and TubeSet with representing the given name.
-func (m *Manager) CreateTubes(name string) {
-	m.tube = gitBeanstalk.NewTube(m.getConnection(), name)
-	m.tubeSet = gitBeanstalk.NewTubeSet(m.getConnection(), name)
+func (m *Manager) connect(ctx context.Context) error {
+	producer, err := m.dial(ctx)
+	if err != nil {
+		return err
+	}
+	consumer, err := m.dial(ctx)
+	if err != nil {
+		_ = producer.Close()
+		return err
+	}
+	m.tube = beanstalk.NewTube(producer, m.tubeName)
+	m.tubeSet = beanstalk.NewTubeSet(consumer, m.tubeName)
+	return nil
 }
 
-// PutJob put job into the beanstalk.
-func (m *Manager) PutJob(body []byte, pri uint32, delay, ttr time.Duration) (id uint64, err error) {
-	return m.tube.Put(body, pri, delay, ttr)
+func (m *Manager) Put(body []byte, priority uint32, delay, ttr time.Duration) (uint64, error) {
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	for {
+		id, err := m.tube.Put(body, priority, delay, ttr)
+		if !isNetworkError(err) || m.closed.Load() {
+			return id, err
+		}
+		if err := m.reconnectProducerLocked(); err != nil {
+			return 0, err
+		}
+	}
+}
+func (m *Manager) Reserve(timeout time.Duration) (uint64, []byte, error) {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+	for {
+		id, body, err := m.tubeSet.Reserve(timeout)
+		if !isNetworkError(err) || m.closed.Load() {
+			return id, body, err
+		}
+		if err := m.reconnectConsumerLocked(); err != nil {
+			return 0, nil, err
+		}
+	}
+}
+func (m *Manager) Delete(id uint64) error {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+	return m.retryConsumerLocked(func() error { return m.tubeSet.Conn.Delete(id) })
+}
+func (m *Manager) Release(id uint64, priority uint32, delay time.Duration) error {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+	return m.retryConsumerLocked(func() error { return m.tubeSet.Conn.Release(id, priority, delay) })
+}
+func (m *Manager) Touch(id uint64) error {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+	return m.retryConsumerLocked(func() error { return m.tubeSet.Conn.Touch(id) })
+}
+func (m *Manager) Attempts(id uint64) (uint64, error) {
+	m.receiveMu.Lock()
+	defer m.receiveMu.Unlock()
+	values, err := m.tubeSet.Conn.StatsJob(id)
+	if err != nil {
+		return 0, err
+	}
+	return m.statistic[uint64](values, "reserves")
+}
+func (m *Manager) Stats() (TubeStats, error) {
+	m.sendMu.Lock()
+	defer m.sendMu.Unlock()
+	values, err := m.tube.Stats()
+	if err != nil {
+		return TubeStats{}, err
+	}
+	ready, err := m.statistic[int64](values, "current-jobs-ready")
+	if err != nil {
+		return TubeStats{}, err
+	}
+	delayed, err := m.statistic[int64](values, "current-jobs-delayed")
+	if err != nil {
+		return TubeStats{}, err
+	}
+	reserved, err := m.statistic[int64](values, "current-jobs-reserved")
+	if err != nil {
+		return TubeStats{}, err
+	}
+	return TubeStats{Ready: ready, Delayed: delayed, Reserved: reserved}, nil
+}
+func (m *Manager) Close() error {
+	m.closed.Store(true)
+	m.cancel()
+	m.sendMu.Lock()
+	m.receiveMu.Lock()
+	defer m.sendMu.Unlock()
+	defer m.receiveMu.Unlock()
+	return errors.Join(m.tube.Conn.Close(), m.tubeSet.Conn.Close())
 }
 
-// GetJob attempts to get a job from the beanstalk within the specified time.
-func (m *Manager) GetJob(timeout time.Duration) (id uint64, body []byte, err error) {
-	return m.tubeSet.Reserve(timeout)
+func (m *Manager) statistic[Integer ~int64 | ~uint64](values map[string]string, key string) (Integer, error) {
+	value, err := strconv.ParseUint(values[key], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse beanstalk statistic %s: %w", key, err)
+	}
+	return Integer(value), nil
 }
 
-// DeleteJob removes a job from a beanstalk.
-func (m *Manager) DeleteJob(id uint64) error {
-	return m.tubeSet.Conn.Delete(id)
+func (m *Manager) retryConsumerLocked(operation func() error) error {
+	for {
+		err := operation()
+		if !isNetworkError(err) || m.closed.Load() {
+			return err
+		}
+		if err := m.reconnectConsumerLocked(); err != nil {
+			return err
+		}
+	}
 }
 
-// CloseTube closes the underlying network connection for tube.
-func (m *Manager) CloseTube() error {
-	return m.tube.Conn.Close()
+func (m *Manager) reconnectProducerLocked() error {
+	_ = m.tube.Conn.Close()
+	connection, err := m.dial(m.ctx)
+	if err != nil {
+		return err
+	}
+	m.tube = beanstalk.NewTube(connection, m.tubeName)
+	return nil
 }
 
-// CloseTubeSet closes the underlying network connection for tubeSet.
-func (m *Manager) CloseTubeSet() error {
-	return m.tubeSet.Conn.Close()
+func (m *Manager) reconnectConsumerLocked() error {
+	_ = m.tubeSet.Conn.Close()
+	connection, err := m.dial(m.ctx)
+	if err != nil {
+		return err
+	}
+	m.tubeSet = beanstalk.NewTubeSet(connection, m.tubeName)
+	return nil
 }
 
-// ReconnectTube recreates the underlying network connection for tube.
-func (m *Manager) ReconnectTube() {
-	_ = m.CloseTube()
-	time.Sleep(time.Millisecond)
-	m.tube.Conn = m.getConnection()
-}
-
-// ReconnectTubeSet recreates the underlying network connection for tubeSet.
-func (m *Manager) ReconnectTubeSet() {
-	_ = m.CloseTubeSet()
-	time.Sleep(time.Millisecond)
-	m.tubeSet.Conn = m.getConnection()
+func isNetworkError(err error) bool {
+	_, ok := errors.AsType[net.Error](err)
+	return ok
 }

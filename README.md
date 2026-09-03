@@ -3,7 +3,7 @@
 [![Coverage](https://codecov.io/gh/retailcrm/mg-transport-core/branch/master/graph/badge.svg?logo=codecov&logoColor=white)](https://codecov.io/gh/retailcrm/mg-transport-core)
 [![GitHub release](https://img.shields.io/github/release/retailcrm/mg-transport-core.svg?logo=github&logoColor=white)](https://github.com/retailcrm/mg-transport-core/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/retailcrm/mg-transport-core)](https://goreportcard.com/report/github.com/retailcrm/mg-transport-core)
-[![GoLang version](https://img.shields.io/badge/go->=1.22-blue.svg?logo=go&logoColor=white)](https://golang.org/dl/)
+[![GoLang version](https://img.shields.io/badge/go->=1.27-blue.svg?logo=go&logoColor=white)](https://golang.org/dl/)
 [![pkg.go.dev](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/core)
 
 This library provides different functions like error-reporting, logging, localization, etc. in order to make it easier to create transports.
@@ -144,3 +144,29 @@ This library contains helper tool for transports. You can install it via go:
 $ go get -u github.com/retailcrm/mg-transport-core/cmd/transport-core-tool
 ```
 Currently, it only can generate new migrations for your transport.
+
+### Queue backends
+
+`core/queue` provides a typed queue, workers, and a queue store independent of storage. Backends live in
+`core/queue/memory`, `core/queue/beanstalk`, and `core/queue/nats`. Persistent backends accept a `queue.Codec[T]`;
+`queue.JSONCodec[T]` uses Go's JSON v2 implementation.
+
+```go
+backend := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
+jobs := queue.New(1, backend)
+
+if err := jobs.Enqueue(ctx, job, queue.WithDelay(time.Minute)); err != nil {
+    return err
+}
+
+delivery, err := jobs.Dequeue(ctx)
+if err != nil {
+    return err
+}
+return delivery.Ack(ctx)
+```
+
+Deliveries must be explicitly acknowledged, requeued, or rejected. `Touch` renews the backend acknowledgment lease.
+An unsettled worker delivery remains pending unless `queue.WithUnsettledProcessor` is configured. The NATS backend
+uses a durable JetStream pull consumer and requires message schedules. Its `Ensure` mode can create or update the
+stream and consumer; `BindExisting` only validates pre-provisioned resources.
