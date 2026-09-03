@@ -12,17 +12,24 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/cache"
 )
 
+// Options configures a memory backend. Capacity is required; TTL is optional.
 type Options struct {
+	// Capacity is the maximum number of entries; it must be positive.
 	Capacity int
-	TTL      time.Duration
+	// TTL expires every entry a fixed duration after it was written. Zero disables expiry.
+	TTL time.Duration
 }
 
+// Backend is a process-local cache.Backend built on an otter cache with hard capacity and an optional
+// write-time TTL. It is safe for concurrent use and does not persist entries.
 type Backend[K comparable, V any] struct {
 	cache     *otter.Cache[K, V]
 	closed    atomic.Bool
 	closeOnce sync.Once
 }
 
+// New creates a memory backend with the given capacity and TTL. It fails when the capacity is not
+// positive or the TTL is negative.
 func New[K comparable, V any](options Options) (*Backend[K, V], error) {
 	if options.Capacity <= 0 {
 		return nil, errors.New("memory cache capacity must be positive")
@@ -52,6 +59,7 @@ func (b *Backend[K, V]) check(ctx context.Context) error {
 	return nil
 }
 
+// Get returns the value for the key if present and not expired.
 func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	if err := b.check(ctx); err != nil {
 		var zero V
@@ -61,6 +69,7 @@ func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	return value, found, nil
 }
 
+// Set stores the value under the key, evicting other entries when the capacity is exceeded.
 func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -69,6 +78,7 @@ func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 	return nil
 }
 
+// Has reports whether the key is present without returning the value.
 func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
 	if err := b.check(ctx); err != nil {
 		return false, err
@@ -77,6 +87,7 @@ func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
 	return found, nil
 }
 
+// Delete removes the key. Deleting a missing key is not an error.
 func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -85,6 +96,7 @@ func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 	return nil
 }
 
+// Clear removes every entry.
 func (b *Backend[K, V]) Clear(ctx context.Context) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -93,6 +105,7 @@ func (b *Backend[K, V]) Clear(ctx context.Context) error {
 	return nil
 }
 
+// Len cleans up expired entries and returns the estimated number of remaining entries.
 func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
 	if err := b.check(ctx); err != nil {
 		return 0, err
@@ -101,6 +114,8 @@ func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
 	return b.cache.EstimatedSize(), nil
 }
 
+// Close invalidates all entries, stops the internal maintenance goroutines, and makes subsequent
+// operations return cache.ErrClosed. Close is idempotent.
 func (b *Backend[K, V]) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err

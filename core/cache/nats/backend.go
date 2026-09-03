@@ -12,18 +12,29 @@ import (
 	corenats "github.com/retailcrm/mg-transport-core/v2/core/nats"
 )
 
+// ProvisionMode selects how the backend obtains its JetStream KV bucket.
 type ProvisionMode uint8
 
 const (
+	// BindExisting binds to an already provisioned bucket and validates its TTL against the configured
+	// one instead of creating anything.
 	BindExisting ProvisionMode = iota
+	// Ensure creates or updates the bucket, including its TTL.
 	Ensure
 )
 
+// Config configures a JetStream KV cache backend.
 type Config struct {
-	Bucket    jetstream.KeyValueConfig
+	// Bucket is the JetStream key-value configuration; Bucket.Bucket (the name) and the TTL are used
+	// by both provision modes.
+	Bucket jetstream.KeyValueConfig
+	// Provision selects between creating or updating the bucket (Ensure) and binding to an existing
+	// one with a matching TTL (BindExisting).
 	Provision ProvisionMode
 }
 
+// Backend is a cache.Backend over one JetStream KV bucket shared through a core/nats.Client. It is
+// safe for concurrent use.
 type Backend[K comparable, V any] struct {
 	keyValue  jetstream.KeyValue
 	keyCodec  cache.KeyEncoder[K]
@@ -32,6 +43,9 @@ type Backend[K comparable, V any] struct {
 	closeOnce sync.Once
 }
 
+// New builds a JetStream KV cache backend from a connected core NATS client, a key encoder, a value
+// codec, and a configuration. Depending on Config.Provision it creates or updates the bucket (Ensure)
+// or binds to an existing bucket whose TTL must match the configured one (BindExisting).
 func New[K comparable, V any](
 	ctx context.Context,
 	client *corenats.Client,
@@ -111,6 +125,8 @@ func (b *Backend[K, V]) encodeKey(key K) (string, error) {
 	return encoded, nil
 }
 
+// Get fetches and decodes the value for the key. A missing key yields a zero value, false, and a nil
+// error.
 func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 	if err := b.check(ctx); err != nil {
@@ -134,6 +150,7 @@ func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	return value, true, nil
 }
 
+// Set encodes the value and stores it under the key, replacing any previous entry.
 func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -152,6 +169,7 @@ func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 	return nil
 }
 
+// Has reports whether the key is present without decoding the value.
 func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
 	if err := b.check(ctx); err != nil {
 		return false, err
@@ -170,6 +188,7 @@ func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
 	return true, nil
 }
 
+// Delete purges the key so no per-key history accumulates. Deleting a missing key is not an error.
 func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -189,6 +208,7 @@ func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 	return nil
 }
 
+// Clear purges every key in the bucket. Individual purge failures are joined into the result.
 func (b *Backend[K, V]) Clear(ctx context.Context) error {
 	if err := b.check(ctx); err != nil {
 		return err
@@ -209,6 +229,7 @@ func (b *Backend[K, V]) Clear(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// Len counts the keys currently present in the bucket.
 func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
 	if err := b.check(ctx); err != nil {
 		return 0, err
@@ -223,6 +244,8 @@ func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
 	return len(keys), nil
 }
 
+// Close marks the backend closed; subsequent operations return cache.ErrClosed. It does not close the
+// shared NATS client and does not delete the bucket. Close is idempotent.
 func (b *Backend[K, V]) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err

@@ -6,27 +6,44 @@ import (
 	"time"
 )
 
+// Processor consumes a single delivery. It receives the queue ID alongside the delivery so one
+// processor can serve every executor of a Store. The processor must settle the delivery with Ack,
+// Requeue, or Reject; if it does not (and no UnsettledProcessor is registered), the delivery stays
+// pending in the backend.
 type Processor[T any] func(context.Context, int, Delivery[T])
+
+// PanicHandler observes the recovered value when a Processor or UnsettledProcessor panics. The panic
+// is already contained by the worker; the handler is only a reporting hook.
 type PanicHandler[T any] func(context.Context, int, Delivery[T], any)
 
+// UnsettledKind describes why an UnsettledProcessor was invoked.
 type UnsettledKind uint8
 
 const (
+	// UnsettledReturned means the processor returned without settling the delivery.
 	UnsettledReturned UnsettledKind = iota + 1
+	// UnsettledPanicked means the processor panicked; the recovered value is in UnsettledCause.Panic.
 	UnsettledPanicked
 )
 
+// UnsettledCause carries the reason an UnsettledProcessor was invoked.
 type UnsettledCause struct {
 	Kind  UnsettledKind
 	Panic any
 }
 
+// UnsettledProcessor handles deliveries that reached the end of processing without an explicit Ack,
+// Requeue, or Reject. It is the recommended place for fallback settlement (for example, Reject with
+// logging) and for recording delivery losses caused by processor panics.
 type UnsettledProcessor[T any] func(context.Context, int, Delivery[T], UnsettledCause)
 
+// WorkerResult reports why a Worker Run call returned.
 type WorkerResult uint8
 
 const (
+	// WorkerIdle means no delivery arrived within the idle timeout and the worker can be retired.
 	WorkerIdle WorkerResult = iota
+	// WorkerStopped means the worker hit an error or cancellation and cannot continue.
 	WorkerStopped
 )
 
@@ -35,6 +52,8 @@ type Worker interface {
 	Run(context.Context) WorkerResult
 }
 
+// WorkerConfig is the set of collaborators handed to a WorkerFactory. IdleTimeout bounds a single
+// dequeue attempt: a worker that times out reports WorkerIdle and becomes a candidate for retirement.
 type WorkerConfig[T any] struct {
 	Queue              *Queue[T]
 	Processor          Processor[T]
@@ -43,6 +62,8 @@ type WorkerConfig[T any] struct {
 	IdleTimeout        time.Duration
 }
 
+// WorkerFactory builds a Worker for a queue. Override it with WithWorkerFactory to plug in custom
+// instrumentation, delivery wrapping, or an alternative consumption strategy.
 type WorkerFactory[T any] func(WorkerConfig[T]) Worker
 
 type defaultWorker[T any] struct {

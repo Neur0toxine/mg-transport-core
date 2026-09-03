@@ -10,18 +10,27 @@ import (
 
 const drainPollInterval = 10 * time.Millisecond
 
+// BackendConstructor builds a Backend for the given queue ID. It is called lazily when a Store creates
+// an executor, which lets transports bind the backend configuration (codec, subject, tube name) to the
+// account the queue serves.
 type BackendConstructor[T any] func(context.Context, int) (Backend[T], error)
 
+// StoreOption configures a Store at construction time.
 type StoreOption[T any] func(*Store[T])
 
+// WithPanicHandler registers a handler invoked with the recovered value whenever a processor or an
+// unsettled processor panics.
 func WithPanicHandler[T any](handler PanicHandler[T]) StoreOption[T] {
 	return func(store *Store[T]) { store.panicHandler = handler }
 }
 
+// WithUnsettledProcessor registers a processor invoked for deliveries that finished processing without
+// an explicit settlement, including deliveries abandoned because of a processor panic.
 func WithUnsettledProcessor[T any](processor UnsettledProcessor[T]) StoreOption[T] {
 	return func(store *Store[T]) { store.unsettled = processor }
 }
 
+// WithWorkerFactory replaces the default worker implementation for all executors of the store.
 func WithWorkerFactory[T any](factory WorkerFactory[T]) StoreOption[T] {
 	return func(store *Store[T]) { store.workerFactory = factory }
 }
@@ -33,6 +42,11 @@ type storeEntry[T any] struct {
 	removed  bool
 }
 
+// Store manages one Executor per numeric queue ID (usually a transport account ID). Executors are
+// created lazily on first use through a BackendConstructor and removed by Remove or Reconcile. The
+// store applies the same processor, worker policy, and options to every executor.
+//
+// All Store methods are safe for concurrent use.
 type Store[T any] struct {
 	mu                 sync.RWMutex
 	executors          map[int]*storeEntry[T]
@@ -47,6 +61,10 @@ type Store[T any] struct {
 	intakeClosed       bool
 }
 
+// NewStore creates a store from a backend constructor, a processor shared by all executors, and a
+// worker policy. Optional StoreOption values can register panic and unsettled-delivery handling or a
+// custom worker factory. The constructor returns an error when required arguments are missing or the
+// policy is invalid.
 func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], policy WorkerPolicy,
 	options ...StoreOption[T],
 ) (*Store[T], error) {
@@ -72,6 +90,9 @@ func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], 
 	return store, nil
 }
 
+// Get returns the executor for the given queue ID, creating it on first use. Concurrent callers for the
+// same ID block until the backend is constructed; construction failures are returned to every waiter
+// and do not leave a broken entry behind. It returns context.Canceled after Stop.
 func (s *Store[T]) Get(ctx context.Context, id int) (*Executor[T], error) {
 	for {
 		s.mu.Lock()
@@ -141,6 +162,7 @@ func (s *Store[T]) finishConstruction(id int, entry *storeEntry[T], executor *Ex
 	return nil
 }
 
+// Enqueue resolves (and lazily creates) the executor for the queue ID and enqueues the value there.
 func (s *Store[T]) Enqueue(ctx context.Context, id int, value T, options ...EnqueueOption) error {
 	executor, err := s.Get(ctx, id)
 	if err != nil {
@@ -149,6 +171,8 @@ func (s *Store[T]) Enqueue(ctx context.Context, id int, value T, options ...Enqu
 	return executor.Enqueue(ctx, value, options...)
 }
 
+// Info returns the executor snapshot for the queue ID. The second result reports whether an executor
+// exists; a false value carries no error.
 func (s *Store[T]) Info(ctx context.Context, id int) (ExecutorInfo, bool, error) {
 	s.mu.RLock()
 	entry := s.executors[id]
@@ -171,12 +195,17 @@ func (s *Store[T]) Info(ctx context.Context, id int) (ExecutorInfo, bool, error)
 	return info, true, err
 }
 
+// Has reports whether an executor exists for the queue ID, including executors still constructing.
 func (s *Store[T]) Has(id int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.executors[id] != nil
 }
 
+// Reconcile aligns the executor set with the desired list of queue IDs: missing executors are created
+// and executors whose IDs are absent from the list are removed and closed. Call it periodically (for
+// example from a job) to keep queues in sync with the active transport accounts. Duplicate IDs in the
+// list are ignored.
 func (s *Store[T]) Reconcile(ctx context.Context, ids []int) error {
 	desired := make(map[int]struct{}, len(ids))
 	var errs []error
@@ -209,6 +238,8 @@ func (s *Store[T]) Reconcile(ctx context.Context, ids []int) error {
 	return errors.Join(errs...)
 }
 
+// Remove closes and forgets the executor for the queue ID. It waits for a concurrently running
+// construction to finish so the executor is not leaked. Removing an unknown ID is a no-op.
 func (s *Store[T]) Remove(ctx context.Context, id int) error {
 	s.mu.Lock()
 	entry := s.executors[id]
@@ -235,6 +266,8 @@ func (s *Store[T]) Remove(ctx context.Context, id int) error {
 	return entry.executor.Close(ctx)
 }
 
+// CloseIntake closes the intake of every current executor and of executors created afterwards. It is
+// the first phase of a graceful shutdown; follow it with Drain and Stop.
 func (s *Store[T]) CloseIntake() {
 	s.mu.Lock()
 	s.intakeClosed = true
@@ -245,6 +278,8 @@ func (s *Store[T]) CloseIntake() {
 	}
 }
 
+// Stats aggregates the workload counters of every executor. Errors of individual backends are joined;
+// counters of failed executors are skipped.
 func (s *Store[T]) Stats(ctx context.Context) (Stats, error) {
 	s.mu.RLock()
 	entries := make([]*storeEntry[T], 0, len(s.executors))
@@ -278,6 +313,8 @@ func (s *Store[T]) Stats(ctx context.Context) (Stats, error) {
 	return total, errors.Join(errs...)
 }
 
+// Drain blocks until no executor has queued or in-flight items left, or until the context expires.
+// Close intake first to guarantee that the drain terminates.
 func (s *Store[T]) Drain(ctx context.Context) error {
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
@@ -297,6 +334,9 @@ func (s *Store[T]) Drain(ctx context.Context) error {
 	}
 }
 
+// Stop closes every executor (worker groups first, then backends) and renders the store unusable:
+// subsequent Get calls return context.Canceled. Stop is idempotent until it succeeds; it fails fast
+// when the context expires during shutdown, leaving the store in the stopped state.
 func (s *Store[T]) Stop(ctx context.Context) error {
 	s.mu.Lock()
 	if !s.stopped {

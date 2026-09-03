@@ -11,7 +11,10 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
+// Options configures a memory backend.
 type Options struct {
+	// AckWait is the delivery lease duration: an unsettled delivery is re-queued after it expires.
+	// Non-positive values default to 30 seconds.
 	AckWait time.Duration
 }
 
@@ -50,6 +53,9 @@ func (h *delayedHeap[T]) Pop() any {
 	return last
 }
 
+// Memory is a process-local Backend with ready, deferred, and in-flight item sets guarded by a mutex.
+// It implements queue.Backend and is safe for concurrent use within one process; state does not
+// survive restarts.
 type Memory[T any] struct {
 	mu        sync.Mutex
 	notify    chan struct{}
@@ -63,6 +69,8 @@ type Memory[T any] struct {
 	sequence  atomic.Uint64
 }
 
+// New creates a memory backend. Items are held only in the current process, and delayed items are
+// scheduled internally with a heap ordered by their NotBefore time.
 func New[T any](options Options) *Memory[T] {
 	if options.AckWait <= 0 {
 		options.AckWait = 30 * time.Second
@@ -79,6 +87,7 @@ func (b *Memory[T]) signal() {
 	}
 }
 
+// Enqueue stores the item in the ready set or, when delayed options are given, in the deferred heap.
 func (b *Memory[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -118,6 +127,8 @@ func (b *Memory[T]) nextDelay(now time.Time) time.Duration {
 	return max(time.Until(b.delayed[0].notBefore), time.Millisecond)
 }
 
+// Dequeue waits for the next ready item, promoting due deferred items first. The returned delivery
+// carries an AckWait lease; an expired unsettled delivery is re-queued automatically.
 func (b *Memory[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	for {
 		b.mu.Lock()
@@ -166,6 +177,7 @@ func (b *Memory[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	}
 }
 
+// Stats returns the sizes of the ready, deferred, and in-flight sets.
 func (b *Memory[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return queue.Stats{}, err
@@ -176,6 +188,8 @@ func (b *Memory[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	return queue.Stats{Ready: int64(len(b.ready)), Deferred: int64(len(b.delayed)), InFlight: int64(len(b.inFlight))}, nil
 }
 
+// Close stops the lease timers and wakes all blocked dequeues with context.Canceled. Enqueued but
+// unprocessed items are discarded. Close is idempotent.
 func (b *Memory[T]) Close(context.Context) error {
 	b.closeOnce.Do(func() {
 		b.mu.Lock()

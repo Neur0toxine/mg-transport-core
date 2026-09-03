@@ -5,6 +5,9 @@ import (
 	"errors"
 )
 
+// Codec converts items to bytes and back for backends that persist deliveries. The Decode
+// implementation must be deterministic across process restarts, so runtime-only dependencies should be
+// restored with FuncCodec rather than serialized.
 type Codec[T any] interface {
 	Encode(T) ([]byte, error)
 	Decode([]byte) (T, error)
@@ -32,6 +35,8 @@ func (c FuncCodec[T]) Decode(data []byte) (T, error) {
 	return c.DecodeFunc(data)
 }
 
+// JSONCodec serializes items with the encoding/json/v2 package. It suits most persisted types; use
+// FuncCodec when decoding requires additional runtime context.
 type JSONCodec[T any] struct{}
 
 func (JSONCodec[T]) Encode(value T) ([]byte, error) {
@@ -44,6 +49,7 @@ func (JSONCodec[T]) Decode(data []byte) (T, error) {
 	return value, err
 }
 
+// BytesCodec is a pass-through codec for payloads that are already encoded ([]byte items).
 type BytesCodec struct{}
 
 func (BytesCodec) Encode(value []byte) ([]byte, error) {

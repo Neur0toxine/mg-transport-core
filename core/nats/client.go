@@ -14,6 +14,10 @@ import (
 	"go.uber.org/zap"
 )
 
+// Auth selects a NATS authentication method. Exactly one method may be configured: username/password,
+// token, credentials file, NKey seed file, or a JWT with its seed file. Connect fails when several
+// methods are mixed or when a method is half-configured (a password without a username, a JWT without
+// a seed file, or vice versa).
 type Auth struct {
 	Username        string
 	Password        string
@@ -24,6 +28,9 @@ type Auth struct {
 	JWTSeedFile     string
 }
 
+// Config configures a NATS connection. Zero values are replaced with sane defaults: a 2s connect
+// timeout, a 2s reconnect wait, a 30s drain timeout, up to 60 reconnect attempts, and the default
+// NATS URL when URLs is empty.
 type Config struct {
 	URLs                 []string
 	Name                 string
@@ -36,11 +43,16 @@ type Config struct {
 	RetryOnFailedConnect bool
 }
 
+// Client bundles the raw NATS connection with a JetStream context built on top of it. The connection
+// is shared: closing or draining it affects every component holding the client.
 type Client struct {
 	Conn      *natsgo.Conn
 	JetStream jetstream.JetStream
 }
 
+// Connect establishes a NATS connection described by the config, installs logging handlers on the
+// given logger (a nil logger is replaced with a no-op one), creates a JetStream context, and returns
+// both as a Client. Additional nats.go options are appended after the generated ones.
 func Connect(ctx context.Context, config Config, log logger.Logger, additional ...natsgo.Option) (*Client, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -141,6 +153,8 @@ func authOption(auth Auth) (natsgo.Option, error) {
 	}
 }
 
+// Drain gracefully closes the connection: it flushes pending messages and waits for subscriptions to
+// settle, falling back to a hard Close when the context expires.
 func (c *Client) Drain(ctx context.Context) error {
 	done := make(chan error, 1)
 	go func() { done <- c.Conn.Drain() }()
@@ -153,4 +167,6 @@ func (c *Client) Drain(ctx context.Context) error {
 	}
 }
 
+// Close immediately closes the connection, discarding buffered messages. Prefer Drain during graceful
+// shutdown.
 func (c *Client) Close() { c.Conn.Close() }

@@ -16,22 +16,41 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
+// ProvisionMode selects how the backend obtains its JetStream stream and consumer.
 type ProvisionMode uint8
 
 const (
+	// BindExisting binds to an already provisioned stream and consumer and validates their
+	// configuration instead of creating anything.
 	BindExisting ProvisionMode = iota
+	// Ensure creates or updates the stream and the durable consumer, covering the queue and schedule
+	// subjects.
 	Ensure
 )
 
+// Config configures a JetStream queue backend.
 type Config struct {
-	Subject         string
+	// Subject is the subject ready items are published to and the consumer filters on. Required.
+	Subject string
+	// ScheduleSubject is the prefix for scheduled (deferred) messages; it defaults to Subject +
+	// ".schedule". The stream must cover "<ScheduleSubject>.>".
 	ScheduleSubject string
-	Stream          jetstream.StreamConfig
-	Consumer        jetstream.ConsumerConfig
-	Provision       ProvisionMode
-	FetchMaxWait    time.Duration
+	// Stream is the JetStream stream configuration. Ensure uses it verbatim (adding the queue and
+	// schedule subjects and enabling message schedules when Subjects is empty); BindExisting uses
+	// only the Name for lookup and validates the rest.
+	Stream jetstream.StreamConfig
+	// Consumer is the durable pull consumer configuration. Either Name or Durable must be set; the
+	// other defaults to the provided one. The backend enforces explicit acknowledgments and the
+	// queue-subject filter.
+	Consumer jetstream.ConsumerConfig
+	// Provision selects between creating the resources and binding to existing ones.
+	Provision ProvisionMode
+	// FetchMaxWait bounds a single consumer fetch while dequeue-polling; it defaults to one second.
+	FetchMaxWait time.Duration
 }
 
+// Backend is a queue.Backend implementation over one JetStream stream and one durable pull consumer.
+// It is safe for concurrent use.
 type Backend[T any] struct {
 	js       jetstream.JetStream
 	stream   jetstream.Stream
@@ -47,6 +66,9 @@ type envelope struct {
 	Payload    []byte    `json:"payload"`
 }
 
+// New builds a JetStream queue backend from a connected core NATS client, an item codec, and a
+// configuration. Depending on Config.Provision it creates or updates the stream and consumer (Ensure)
+// or binds to and validates existing ones (BindExisting).
 func New[T any](ctx context.Context, client *corenats.Client, codec queue.Codec[T], config Config) (*Backend[T], error) {
 	if client == nil || client.JetStream == nil {
 		return nil, errors.New("NATS JetStream client is required")
@@ -140,6 +162,9 @@ func (b *Backend[T]) bind(ctx context.Context) error {
 	return nil
 }
 
+// Enqueue publishes the encoded item to the queue subject, or to the schedule subject with a
+// schedule-at time when the item is deferred. The enqueue ID is used as the JetStream message ID for
+// deduplication.
 func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
 	if b.closed.Load() {
 		return context.Canceled
@@ -170,6 +195,9 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 	return nil
 }
 
+// Dequeue fetches the next message from the durable consumer. Messages whose envelope or payload
+// cannot be decoded are terminated; the error is returned to the caller, and the next Dequeue attempt
+// fetches the following message.
 func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -204,6 +232,9 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	}
 }
 
+// Stats maps consumer and stream counters to the queue counters: pending messages are Ready,
+// scheduled messages under the schedule subject are Deferred, and unacknowledged deliveries are
+// InFlight.
 func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	info, err := b.consumer.Info(ctx)
 	if err != nil {
@@ -220,6 +251,8 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	return queue.Stats{Ready: int64(info.NumPending), Deferred: int64(deferred), InFlight: int64(info.NumAckPending)}, nil
 }
 
+// Close stops dequeue-polling. The stream, consumer, and the shared client connection stay intact so
+// other users of the stream are unaffected.
 func (b *Backend[T]) Close(context.Context) error {
 	b.closed.Store(true)
 	return nil

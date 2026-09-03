@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+// ScaleInfo is the input for scaling decisions: queue identity, the last enqueue time, the backend
+// statistics, and the number of currently active workers.
 type ScaleInfo struct {
 	ID              int
 	LastEnqueueTime time.Time
@@ -14,8 +16,19 @@ type ScaleInfo struct {
 	ActiveWorkers   int
 }
 
+// DesiredWorkersFunc computes the desired worker count for a queue. It is consulted by the worker
+// group controller on every scaling tick and on enqueue notifications. Returned values are clamped to
+// the [MinWorkers, MaxWorkers] range; panics are contained and fall back to MinWorkers.
 type DesiredWorkersFunc func(ScaleInfo) int
 
+// WorkerPolicy describes how the worker pool of a single executor scales and how workers behave:
+//
+//   - MinWorkers/MaxWorkers bound the pool size; at least one worker must be allowed.
+//   - JobsPerWorker sets the default scaling ratio: ceil(Ready/JobsPerWorker) workers are desired.
+//   - DesiredWorkers, when set, replaces the JobsPerWorker ratio with a custom function.
+//   - IdleTimeout bounds a dequeue attempt before a worker reports idleness and becomes retirable.
+//   - ScaleInterval is the period of the periodic scaling tick; scaling also runs on enqueue.
+//   - RestartDelay throttles worker replacement after an unexpected worker failure.
 type WorkerPolicy struct {
 	MinWorkers     int
 	MaxWorkers     int

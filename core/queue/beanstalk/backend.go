@@ -12,12 +12,19 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
+// Options configures a beanstalk backend.
 type Options struct {
-	Priority    uint32
-	TTR         time.Duration
+	// Priority is the beanstalkd job priority used on Put and Release; lower values mean higher priority.
+	Priority uint32
+	// TTR is the beanstalkd time-to-run, which acts as the delivery lease: an unsettled job is
+	// re-released by the server after it expires. Non-positive values default to one minute.
+	TTR time.Duration
+	// PollTimeout bounds a single reserve attempt before retrying. Non-positive values default to one
+	// second.
 	PollTimeout time.Duration
 }
 
+// Backend is a queue.Backend implementation on top of a beanstalkd tube managed by a Manager.
 type Backend[T any] struct {
 	manager ManagerInterface
 	codec   queue.Codec[T]
@@ -31,6 +38,8 @@ type envelope struct {
 	Payload    []byte    `json:"payload"`
 }
 
+// New creates a beanstalk backend over the given manager. The codec serializes items into the
+// beanstalkd job body wrapped into an envelope with the delivery ID and enqueue timestamp.
 func New[T any](manager ManagerInterface, codec queue.Codec[T], options Options) *Backend[T] {
 	if options.TTR <= 0 {
 		options.TTR = time.Minute
@@ -41,6 +50,8 @@ func New[T any](manager ManagerInterface, codec queue.Codec[T], options Options)
 	return &Backend[T]{manager: manager, codec: codec, options: options}
 }
 
+// Enqueue encodes the item and puts it into the tube, using native beanstalkd delays for deferred
+// items.
 func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -63,6 +74,8 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 	return err
 }
 
+// Dequeue reserves the next job from the tube. Jobs whose envelope or payload cannot be decoded are
+// deleted; the error is returned to the caller, and the next Dequeue attempt fetches the following job.
 func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	for {
 		if err := ctx.Err(); err != nil {
@@ -94,6 +107,7 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	}
 }
 
+// Stats maps tube statistics to the queue counters: ready, delayed, and reserved jobs.
 func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return queue.Stats{}, err
@@ -101,6 +115,9 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	stats, err := b.manager.Stats()
 	return queue.Stats{Ready: stats.Ready, Deferred: stats.Delayed, InFlight: stats.Reserved}, err
 }
+
+// Close marks the backend closed and closes the underlying manager connections. Jobs remaining in the
+// tube are kept by the server for later consumption.
 func (b *Backend[T]) Close(context.Context) error {
 	b.closed.Store(true)
 	return b.manager.Close()

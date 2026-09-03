@@ -8,6 +8,10 @@
 
 This library provides different functions like error-reporting, logging, localization, etc. in order to make it easier to create transports.
 
+Full documentation with architecture diagrams and guides lives in [docs/](docs/README.md):
+[architecture overview](docs/architecture.md), [engine](docs/engine.md), [queues](docs/queues.md),
+[cache](docs/cache.md), [NATS](docs/nats.md), and a [package reference](docs/packages.md).
+
 Usage:
 ```go
 package main

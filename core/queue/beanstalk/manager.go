@@ -15,12 +15,15 @@ import (
 	"go.uber.org/zap"
 )
 
+// TubeStats is a snapshot of the tube job counters used for queue statistics.
 type TubeStats struct {
 	Ready    int64
 	Delayed  int64
 	Reserved int64
 }
 
+// ManagerInterface is the subset of beanstalkd operations required by a Backend. It is implemented by
+// Manager and can be satisfied by test doubles.
 type ManagerInterface interface {
 	Put([]byte, uint32, time.Duration, time.Duration) (uint64, error)
 	Reserve(time.Duration) (uint64, []byte, error)
@@ -32,6 +35,10 @@ type ManagerInterface interface {
 	Close() error
 }
 
+// Manager maintains two dedicated beanstalkd connections to a single tube: a producer connection for
+// Put and Stats, and a consumer connection for Reserve and settlement calls. Both connections
+// reconnect automatically (with the configured delay) whenever a network error is detected, so the
+// Manager survives beanstalkd restarts. All methods are safe for concurrent use.
 type Manager struct {
 	address        string
 	tubeName       string
@@ -46,6 +53,9 @@ type Manager struct {
 	tubeSet        *beanstalk.TubeSet
 }
 
+// NewManager dials the beanstalkd server at address and binds one producer and one consumer
+// connection to the tube. It retries dialing until the context is canceled; reconnectDelay throttles
+// the retry loop (default one second). A nil log falls back to a no-op logger.
 func NewManager(ctx context.Context, address, tube string, log logger.Logger, reconnectDelay time.Duration) (*Manager, error) {
 	if reconnectDelay <= 0 {
 		reconnectDelay = time.Second
