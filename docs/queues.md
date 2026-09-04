@@ -38,6 +38,7 @@ bound to the account), a processor shared by all queues, and a worker policy.
 
 ```go
 type Job struct {
+    ID        string
     AccountID int
     Payload   string
 }
@@ -68,6 +69,124 @@ jobs, err := queue.NewStore(
         RestartDelay:  time.Second,    // throttle worker replacement after failures
     },
 )
+```
+
+## Complete application example
+
+The store owns the dequeue loop and workers. Application code only enqueues domain values and supplies
+the `Processor` callback where the actual business logic starts. This complete in-memory example also
+shows retry classification, a retry limit, delayed enqueue, and graceful shutdown:
+
+```go
+package main
+
+import (
+    "context"
+    "errors"
+    "log/slog"
+    "time"
+
+    "github.com/retailcrm/mg-transport-core/v2/core/queue"
+    "github.com/retailcrm/mg-transport-core/v2/core/queue/memory"
+)
+
+type SendMessageJob struct {
+    ID        string `json:"id"`
+    AccountID int    `json:"accountId"`
+    Recipient string `json:"recipient"`
+    Text      string `json:"text"`
+}
+
+var ErrTemporary = errors.New("temporary provider failure")
+
+func sendMessage(ctx context.Context, job SendMessageJob) error {
+    // Call the provider/API here. This is the application's business logic.
+    return nil
+}
+
+func processMessage(ctx context.Context, queueID int, delivery queue.Delivery[SendMessageJob]) {
+    job := delivery.Value()
+    err := sendMessage(ctx, job)
+
+    switch {
+    case err == nil:
+        err = delivery.Ack(ctx)
+    case errors.Is(err, ErrTemporary) && delivery.Metadata().Attempt < 5:
+        err = delivery.Requeue(ctx, time.Duration(delivery.Metadata().Attempt)*time.Second)
+    default:
+        // Reject validation errors and jobs that exhausted their retry budget.
+        err = delivery.Reject(ctx)
+    }
+    if err != nil {
+        slog.ErrorContext(ctx, "settle message delivery", "queue_id", queueID, "error", err)
+    }
+}
+
+func run(ctx context.Context) error {
+    jobs, err := queue.NewStore(
+        func(context.Context, int) (queue.Backend[SendMessageJob], error) {
+            // A distinct backend is required for each queue ID.
+            return memory.New[SendMessageJob](memory.Options{AckWait: 30 * time.Second}), nil
+        },
+        processMessage,
+        queue.WorkerPolicy{
+            MinWorkers: 1, MaxWorkers: 8, JobsPerWorker: 20,
+            IdleTimeout: time.Minute, ScaleInterval: time.Second, RestartDelay: time.Second,
+        },
+    )
+    if err != nil {
+        return err
+    }
+
+    job := SendMessageJob{ID: "msg-123", AccountID: 42, Recipient: "+15551234567", Text: "Hello"}
+    if err := jobs.Enqueue(ctx, job.AccountID, job, queue.WithID(job.ID)); err != nil {
+        _ = jobs.Stop(context.WithoutCancel(ctx))
+        return err
+    }
+    if err := jobs.Enqueue(ctx, job.AccountID, job, queue.WithID("msg-124"), queue.WithDelay(time.Minute)); err != nil {
+        _ = jobs.Stop(context.WithoutCancel(ctx))
+        return err
+    }
+
+    <-ctx.Done() // Usually canceled by SIGINT/SIGTERM handling in main.
+
+    shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+    defer cancel()
+    jobs.CloseIntake()
+    if err := jobs.Drain(shutdownCtx); err != nil {
+        _ = jobs.Stop(shutdownCtx)
+        return err
+    }
+    return jobs.Stop(shutdownCtx)
+}
+```
+
+`MinWorkers` starts consumers as soon as an executor is created. `Store.Enqueue` lazily creates that
+executor, starts its worker group, stores the job, and wakes the scaling controller. Do not start a
+second dequeue goroutine when using a store—the store already does that.
+
+## Direct queue use (without managed workers)
+
+For a command, test, or deliberately custom consume loop, wrap one backend in `queue.Queue` and call
+`Dequeue` yourself. A direct queue has no autoscaling, no panic recovery, and no unsettled fallback:
+
+```go
+backend := memory.New[SendMessageJob](memory.Options{AckWait: 30 * time.Second})
+jobs := queue.New(42, backend)
+defer func() { _ = jobs.Close(context.WithoutCancel(ctx)) }()
+
+if err := jobs.Enqueue(ctx, job, queue.WithID(job.ID)); err != nil {
+    return err
+}
+
+delivery, err := jobs.Dequeue(ctx) // blocks until a job arrives or ctx is canceled
+if err != nil {
+    return err
+}
+if err := sendMessage(ctx, delivery.Value()); err != nil {
+    return delivery.Requeue(ctx, time.Second)
+}
+return delivery.Ack(ctx)
 ```
 
 ### Enqueuing
@@ -178,17 +297,18 @@ backend := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
 (producer and consumer) and reconnects them automatically on network errors.
 
 ```go
-manager, err := beanstalk.NewManager(ctx, "beanstalkd:11300", "transport.jobs", log, time.Second)
-if err != nil {
-    return err
-}
-defer func() { _ = manager.Close() }()
-
 backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], error) {
+    // Each executor needs its own manager because a manager is bound to one tube.
+    tube := fmt.Sprintf("transport.%d.jobs", accountID)
+    manager, err := beanstalk.NewManager(ctx, "beanstalkd:11300", tube, log, time.Second)
+    if err != nil {
+        return nil, err
+    }
     return beanstalk.New[Job](manager, queue.JSONCodec[Job]{}, beanstalk.Options{
         Priority: 1,
         TTR:      time.Minute, // delivery lease
-    }), nil
+        PollTimeout: time.Second,
+    }), nil // Closing the executor closes this manager.
 }
 ```
 
@@ -212,14 +332,18 @@ backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], erro
     return nats.New[Job](ctx, client, queue.JSONCodec[Job]{}, nats.Config{
         Subject: fmt.Sprintf("transport.%d.jobs", accountID),
         Stream: jetstream.StreamConfig{
-            Name:              "TRANSPORT_JOBS",
+            Name:              fmt.Sprintf("TRANSPORT_JOBS_%d", accountID),
             AllowMsgSchedules: true,
         },
-        Consumer:  jetstream.ConsumerConfig{Name: "transport-jobs"},
+        Consumer:  jetstream.ConsumerConfig{Name: fmt.Sprintf("transport-jobs-%d", accountID)},
         Provision: nats.Ensure, // or nats.BindExisting for externally managed infrastructure
     })
 }
 ```
+
+Create the shared NATS client once at application startup, pass it to every backend constructor, stop
+the queue store first during shutdown, and then call `client.Drain(shutdownCtx)`. Closing a queue
+backend does not close the shared client.
 
 The enqueue ID is used as the JetStream message ID, giving publisher-side deduplication. `Stats` maps
 consumer pending (Ready), scheduled messages (Deferred), and unacknowledged deliveries (InFlight).
