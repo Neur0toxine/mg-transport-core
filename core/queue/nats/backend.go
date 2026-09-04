@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -393,7 +394,7 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 		return queue.Stats{}, err
 	}
 	if b.config.DisableScheduling {
-		return queue.Stats{Ready: int64(info.NumPending), InFlight: int64(info.NumAckPending)}, nil
+		return queue.Stats{Ready: queueCount(info.NumPending), InFlight: int64(info.NumAckPending)}, nil
 	}
 	streamInfo, err := b.stream.Info(ctx, jetstream.WithSubjectFilter(b.config.ScheduleSubject+".>"))
 	if err != nil {
@@ -403,7 +404,13 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	for _, count := range streamInfo.State.Subjects {
 		deferred += count
 	}
-	return queue.Stats{Ready: int64(info.NumPending), Deferred: int64(deferred), InFlight: int64(info.NumAckPending)}, nil
+	return queue.Stats{
+		Ready: queueCount(info.NumPending), Deferred: queueCount(deferred), InFlight: int64(info.NumAckPending),
+	}, nil
+}
+
+func queueCount(value uint64) int64 {
+	return int64(min(value, uint64(math.MaxInt64)))
 }
 
 // Close stops dequeue-polling. The stream, consumer, and the shared client connection stay intact so
