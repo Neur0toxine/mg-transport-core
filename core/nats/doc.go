@@ -1,4 +1,4 @@
-// Package nats provides the shared NATS connection used by the queue and cache JetStream backends.
+// Package nats provides the shared NATS connection used by the queue and cache JetStream drivers.
 //
 // # Architecture
 //
@@ -8,8 +8,8 @@
 // the raw connection it creates a JetStream context, returning both as a Client. The caller may pass
 // additional nats.go options for anything the Config does not cover.
 //
-// One Client is intended to be shared by every NATS-based component of a transport (queue backends,
-// cache backends, custom consumers): JetStream contexts are cheap, while each Client owns a single
+// One Client is intended to be shared by every NATS-based component of a transport (queue drivers,
+// cache drivers, custom consumers): JetStream contexts are cheap, while each Client owns a single
 // TCP connection with its own buffers and reconnect state.
 //
 // # Usage

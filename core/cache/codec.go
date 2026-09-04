@@ -6,7 +6,7 @@ import (
 	json "encoding/json/v2"
 )
 
-// Codec converts cache values to bytes and back for backends that persist entries.
+// Codec converts cache values to bytes and back for drivers that persist entries.
 type Codec[T any] interface {
 	Encode(T) ([]byte, error)
 	Decode([]byte) (T, error)
@@ -36,12 +36,12 @@ func (BytesCodec) Decode(data []byte) ([]byte, error) {
 	return bytes.Clone(data), nil
 }
 
-// KeyEncoder converts typed cache keys into the string keys required by persistent backends.
+// KeyEncoder converts typed cache keys into the string keys required by persistent drivers.
 type KeyEncoder[K comparable] interface {
 	EncodeKey(K) (string, error)
 }
 
-// KeyDecoder converts a persistent backend key back to its typed form.
+// KeyDecoder converts a persistent driver key back to its typed form.
 type KeyDecoder[K comparable] interface {
 	DecodeKey(string) (K, error)
 }

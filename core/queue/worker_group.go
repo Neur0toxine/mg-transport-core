@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// ScaleInfo is the input for scaling decisions: queue identity, the last enqueue time, the backend
+// ScaleInfo is the input for scaling decisions: queue identity, the last enqueue time, the driver
 // statistics, and the number of currently active workers.
 type ScaleInfo struct {
 	ID              int

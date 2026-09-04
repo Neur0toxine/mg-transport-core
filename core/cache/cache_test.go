@@ -9,45 +9,45 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type backendStub struct {
+type driverStub struct {
 	items map[string]int
 }
 
-func (b *backendStub) Get(_ context.Context, key string) (int, bool, error) {
+func (b *driverStub) Get(_ context.Context, key string) (int, bool, error) {
 	value, found := b.items[key]
 	return value, found, nil
 }
 
-func (b *backendStub) Set(_ context.Context, key string, value int) error {
+func (b *driverStub) Set(_ context.Context, key string, value int) error {
 	b.items[key] = value
 	return nil
 }
 
-func (b *backendStub) Has(_ context.Context, key string) (bool, error) {
+func (b *driverStub) Has(_ context.Context, key string) (bool, error) {
 	_, found := b.items[key]
 	return found, nil
 }
 
-func (b *backendStub) Delete(_ context.Context, key string) error {
+func (b *driverStub) Delete(_ context.Context, key string) error {
 	delete(b.items, key)
 	return nil
 }
 
-func (b *backendStub) Clear(context.Context) error {
+func (b *driverStub) Clear(context.Context) error {
 	clear(b.items)
 	return nil
 }
 
-func (b *backendStub) Len(context.Context) (int, error) {
+func (b *driverStub) Len(context.Context) (int, error) {
 	return len(b.items), nil
 }
 
-func (b *backendStub) Close(context.Context) error {
+func (b *driverStub) Close(context.Context) error {
 	return nil
 }
 
-func TestCacheDelegatesToBackend(t *testing.T) {
-	c := cache.New[string, int](&backendStub{items: make(map[string]int)})
+func TestCacheDelegatesToDriver(t *testing.T) {
+	c := cache.New[string, int](&driverStub{items: make(map[string]int)})
 
 	require.NoError(t, c.Set(t.Context(), "answer", 42))
 	value, found, err := c.Get(t.Context(), "answer")

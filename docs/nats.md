@@ -56,19 +56,19 @@ arguments to `Connect`.
 
 ## One connection, many subsystems
 
-Queue and cache backends accept the shared client instead of dialing their own connections:
+Queue and cache drivers accept the shared client instead of dialing their own connections:
 
 ```mermaid
 flowchart TB
     CONN["core/nats.Client<br/>(1 TCP connection, auth, reconnects)"]
 
-    subgraph queues["queue/nats backends (per account)"]
-        QB1["Backend[Job] subject=transport.1.jobs"]
-        QB2["Backend[Job] subject=transport.2.jobs"]
+    subgraph queues["queue/nats drivers (per account)"]
+        QB1["Driver[Job] subject=transport.1.jobs"]
+        QB2["Driver[Job] subject=transport.2.jobs"]
     end
 
-    subgraph caches["cache/nats backends"]
-        CB1["Backend[int, Account]<br/>bucket=accounts"]
+    subgraph caches["cache/nats drivers"]
+        CB1["Driver[int, Account]<br/>bucket=accounts"]
     end
 
     CONN --> QB1
@@ -87,12 +87,12 @@ flowchart TB
     CB1 --> KV
 ```
 
-Closing a backend never closes the shared client — connection lifetime belongs to the transport
+Closing a driver never closes the shared client — connection lifetime belongs to the transport
 bootstrap code.
 
 ## Provisioning modes
 
-Both NATS backends select their provisioning behavior with a `ProvisionMode`:
+Both NATS drivers select their provisioning behavior with a `ProvisionMode`:
 
 | Mode | Behavior |
 |---|---|
@@ -111,5 +111,5 @@ used for delivery state, leases, and shared counters.
 
 ## Where to go next
 
-- Durable queues with schedules and durable consumers: [Queues](queues.md#backends).
+- Durable queues with schedules and durable consumers: [Queues](queues.md#drivers).
 - Shared typed caches with server-side TTL: [Cache](cache.md#nats--jetstream-kv-bucket-shared).

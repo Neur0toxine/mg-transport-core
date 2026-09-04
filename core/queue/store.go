@@ -10,10 +10,10 @@ import (
 
 const drainPollInterval = 10 * time.Millisecond
 
-// BackendConstructor builds a Backend for the given queue ID. It is called lazily when a Store creates
-// an executor, which lets transports bind the backend configuration (codec, subject, tube name) to the
+// DriverConstructor builds a Driver for the given queue ID. It is called lazily when a Store creates
+// an executor, which lets transports bind the driver configuration (codec, subject, tube name) to the
 // account the queue serves.
-type BackendConstructor[T any] func(context.Context, int) (Backend[T], error)
+type DriverConstructor[T any] func(context.Context, int) (Driver[T], error)
 
 // StoreOption configures a Store at construction time.
 type StoreOption[T any] func(*Store[T])
@@ -43,33 +43,33 @@ type storeEntry[T any] struct {
 }
 
 // Store manages one Executor per numeric queue ID (usually a transport account ID). Executors are
-// created lazily on first use through a BackendConstructor and removed by Remove or Reconcile. The
+// created lazily on first use through a DriverConstructor and removed by Remove or Reconcile. The
 // store applies the same processor, worker policy, and options to every executor.
 //
 // All Store methods are safe for concurrent use.
 type Store[T any] struct {
-	mu                 sync.RWMutex
-	executors          map[int]*storeEntry[T]
-	backendConstructor BackendConstructor[T]
-	processor          Processor[T]
-	policy             WorkerPolicy
-	panicHandler       PanicHandler[T]
-	unsettled          UnsettledProcessor[T]
-	workerFactory      WorkerFactory[T]
-	closing            []*storeEntry[T]
-	stopped            bool
-	intakeClosed       bool
+	mu                sync.RWMutex
+	executors         map[int]*storeEntry[T]
+	driverConstructor DriverConstructor[T]
+	processor         Processor[T]
+	policy            WorkerPolicy
+	panicHandler      PanicHandler[T]
+	unsettled         UnsettledProcessor[T]
+	workerFactory     WorkerFactory[T]
+	closing           []*storeEntry[T]
+	stopped           bool
+	intakeClosed      bool
 }
 
-// NewStore creates a store from a backend constructor, a processor shared by all executors, and a
+// NewStore creates a store from a driver constructor, a processor shared by all executors, and a
 // worker policy. Optional StoreOption values can register panic and unsettled-delivery handling or a
 // custom worker factory. The constructor returns an error when required arguments are missing or the
 // policy is invalid.
-func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], policy WorkerPolicy,
+func NewStore[T any](constructor DriverConstructor[T], processor Processor[T], policy WorkerPolicy,
 	options ...StoreOption[T],
 ) (*Store[T], error) {
 	if constructor == nil {
-		return nil, errors.New("backend constructor is required")
+		return nil, errors.New("driver constructor is required")
 	}
 	if processor == nil {
 		return nil, errors.New("processor is required")
@@ -78,7 +78,7 @@ func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], 
 		return nil, err
 	}
 	store := &Store[T]{
-		executors: make(map[int]*storeEntry[T]), backendConstructor: constructor,
+		executors: make(map[int]*storeEntry[T]), driverConstructor: constructor,
 		processor: processor, policy: policy, workerFactory: defaultWorkerFactory[T],
 	}
 	for _, option := range options {
@@ -91,7 +91,7 @@ func NewStore[T any](constructor BackendConstructor[T], processor Processor[T], 
 }
 
 // Get returns the executor for the given queue ID, creating it on first use. Concurrent callers for the
-// same ID block until the backend is constructed; construction failures are returned to every waiter
+// same ID block until the driver is constructed; construction failures are returned to every waiter
 // and do not leave a broken entry behind. It returns context.Canceled after Stop.
 func (s *Store[T]) Get(ctx context.Context, id int) (*Executor[T], error) {
 	for {
@@ -118,17 +118,17 @@ func (s *Store[T]) Get(ctx context.Context, id int) (*Executor[T], error) {
 		s.executors[id] = entry
 		s.mu.Unlock()
 
-		backend, err := s.backendConstructor(ctx, id)
+		driver, err := s.driverConstructor(ctx, id)
 		if err != nil {
 			s.finishConstruction(id, entry, nil, err)
 			return nil, err
 		}
-		if backend == nil {
-			err = errors.New("backend constructor returned nil backend")
+		if driver == nil {
+			err = errors.New("driver constructor returned nil driver")
 			s.finishConstruction(id, entry, nil, err)
 			return nil, err
 		}
-		executor := newExecutor(id, backend, s.processor, s.policy, s.panicHandler, s.unsettled, s.workerFactory)
+		executor := newExecutor(id, driver, s.processor, s.policy, s.panicHandler, s.unsettled, s.workerFactory)
 		if err := s.finishConstruction(id, entry, executor, nil); err != nil {
 			_ = executor.shutdown(context.WithoutCancel(ctx))
 			return nil, err
@@ -278,7 +278,7 @@ func (s *Store[T]) CloseIntake() {
 	}
 }
 
-// Stats aggregates the workload counters of every executor. Errors of individual backends are joined;
+// Stats aggregates the workload counters of every executor. Errors of individual drivers are joined;
 // counters of failed executors are skipped.
 func (s *Store[T]) Stats(ctx context.Context) (Stats, error) {
 	s.mu.RLock()
@@ -334,7 +334,7 @@ func (s *Store[T]) Drain(ctx context.Context) error {
 	}
 }
 
-// Stop closes every executor (worker groups first, then backends) and renders the store unusable:
+// Stop closes every executor (worker groups first, then drivers) and renders the store unusable:
 // subsequent Get calls return context.Canceled. Stop is idempotent until it succeeds; it fails fast
 // when the context expires during shutdown, leaving the store in the stopped state.
 func (s *Store[T]) Stop(ctx context.Context) error {

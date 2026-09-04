@@ -188,7 +188,7 @@ go func() {
 <-sigCh
 jobs.CloseIntake()                                 // stop accepting new queue work (docs/queues.md)
 _ = jobs.Drain(drainCtx)                           // wait for queued work to finish
-_ = jobs.Stop(stopCtx)                             // stop workers and backends
+_ = jobs.Stop(stopCtx)                             // stop workers and drivers
 _ = app.Shutdown(shutdownCtx)                      // graceful HTTP server shutdown
 ```
 

@@ -7,7 +7,7 @@ import (
 )
 
 // ExecutorInfo is an observability snapshot of a single executor: its queue ID, the last enqueue time,
-// the backend statistics, and the number of active workers.
+// the driver statistics, and the number of active workers.
 type ExecutorInfo struct {
 	ID              int
 	LastEnqueueTime time.Time
@@ -22,10 +22,10 @@ type Executor[T any] struct {
 	workers *workerGroup[T]
 }
 
-func newExecutor[T any](id int, backend Backend[T], processor Processor[T], policy WorkerPolicy,
+func newExecutor[T any](id int, driver Driver[T], processor Processor[T], policy WorkerPolicy,
 	panicHandler PanicHandler[T], unsettled UnsettledProcessor[T], factory WorkerFactory[T],
 ) *Executor[T] {
-	q := New(id, backend)
+	q := New(id, driver)
 	executor := &Executor[T]{queue: q}
 	executor.workers = newWorkerGroup(q, processor, policy, panicHandler, unsettled, factory)
 	executor.workers.Start()
@@ -45,7 +45,7 @@ func (e *Executor[T]) Enqueue(ctx context.Context, value T, options ...EnqueueOp
 	return nil
 }
 
-// Info collects the executor observability snapshot, including backend statistics.
+// Info collects the executor observability snapshot, including driver statistics.
 func (e *Executor[T]) Info(ctx context.Context) (ExecutorInfo, error) {
 	stats, err := e.queue.Stats(ctx)
 	return ExecutorInfo{

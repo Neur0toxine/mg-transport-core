@@ -10,8 +10,8 @@ and a multi-queue store keyed by account ID.
 |---|---|---|
 | Store | `queue.Store[T]` | Owns one executor per numeric queue ID; creates them lazily; aggregates stats. |
 | Executor | `queue.Executor[T]` | Operates one queue end to end: enqueue, info, drain, close. |
-| Queue | `queue.Queue[T]` | Wraps a backend with lifecycle guards (intake close, dequeue cancellation). |
-| Backend | `queue.Backend[T]` | Stores items and hands out deliveries. Selected per transport deployment. |
+| Queue | `queue.Queue[T]` | Wraps a driver with lifecycle guards (intake close, dequeue cancellation). |
+| Driver | `queue.Driver[T]` | Stores items and hands out deliveries. Selected per transport deployment. |
 | Delivery | `queue.Delivery[T]` | A dequeued item plus metadata and settlement methods. |
 | Processor | `queue.Processor[T]` | The callback that consumes deliveries. |
 | Worker policy | `queue.WorkerPolicy` | Scaling bounds, ratio, idle timeout, restart delay. |
@@ -26,14 +26,14 @@ flowchart LR
     E1 --> Q1["Queue + workerGroup"]
     E2 --> Q2["Queue + workerGroup"]
     E3 --> Q3["Queue + workerGroup"]
-    Q1 --> B["Backend[T]"]
+    Q1 --> B["Driver[T]"]
     Q2 --> B
     Q3 --> B
 ```
 
 ## Creating a store
 
-A store needs three things: a backend constructor (called lazily per queue ID, so backends can be
+A store needs three things: a driver constructor (called lazily per queue ID, so drivers can be
 bound to the account), a processor shared by all queues, and a worker policy.
 
 ```go
@@ -43,7 +43,7 @@ type Job struct {
     Payload   string
 }
 
-backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], error) {
+driverFor := func(ctx context.Context, accountID int) (queue.Driver[Job], error) {
     return memory.New[Job](memory.Options{AckWait: 30 * time.Second}), nil
 }
 
@@ -58,7 +58,7 @@ process := func(ctx context.Context, accountID int, delivery queue.Delivery[Job]
 }
 
 jobs, err := queue.NewStore(
-    backendFor,
+    driverFor,
     process,
     queue.WorkerPolicy{
         MinWorkers:    1,
@@ -124,8 +124,8 @@ func processMessage(ctx context.Context, queueID int, delivery queue.Delivery[Se
 
 func run(ctx context.Context) error {
     jobs, err := queue.NewStore(
-        func(context.Context, int) (queue.Backend[SendMessageJob], error) {
-            // A distinct backend is required for each queue ID.
+        func(context.Context, int) (queue.Driver[SendMessageJob], error) {
+            // A distinct driver is required for each queue ID.
             return memory.New[SendMessageJob](memory.Options{AckWait: 30 * time.Second}), nil
         },
         processMessage,
@@ -167,12 +167,12 @@ second dequeue goroutine when using a store—the store already does that.
 
 ## Direct queue use (without managed workers)
 
-For a command, test, or deliberately custom consume loop, wrap one backend in `queue.Queue` and call
+For a command, test, or deliberately custom consume loop, wrap one driver in `queue.Queue` and call
 `Dequeue` yourself. A direct queue has no autoscaling, no panic recovery, and no unsettled fallback:
 
 ```go
-backend := memory.New[SendMessageJob](memory.Options{AckWait: 30 * time.Second})
-jobs := queue.New(42, backend)
+driver := memory.New[SendMessageJob](memory.Options{AckWait: 30 * time.Second})
+jobs := queue.New(42, driver)
 defer func() { _ = jobs.Close(context.WithoutCancel(ctx)) }()
 
 if err := jobs.Enqueue(ctx, job, queue.WithID(job.ID)); err != nil {
@@ -193,7 +193,7 @@ return delivery.Ack(ctx)
 
 ```go
 err := jobs.Enqueue(ctx, accountID, job,
-    queue.WithID(job.ID),        // stable ID: enables deduplication on supporting backends
+    queue.WithID(job.ID),        // stable ID: enables deduplication on supporting drivers
     queue.WithDelay(5*time.Min), // or queue.WithNotBefore(deadline)
 )
 ```
@@ -231,7 +231,7 @@ Every dequeued item must be settled exactly once:
 ```mermaid
 sequenceDiagram
     participant W as Worker
-    participant B as Backend
+    participant B as Driver
     participant P as Processor
 
     W->>B: Dequeue(ctx)
@@ -250,15 +250,15 @@ sequenceDiagram
 
 - **Ack** — work is done; the item is removed.
 - **Requeue(delay)** — schedule another attempt; `Metadata.Attempt` increases on redelivery.
-- **Reject** — drop the item entirely (on JetStream backends the message is terminated).
-- **Touch** — renew the backend lease for long-running processing; does not settle the delivery.
+- **Reject** — drop the item entirely (on JetStream drivers the message is terminated).
+- **Touch** — renew the driver lease for long-running processing; does not settle the delivery.
 
 Calling a settlement method twice returns `queue.ErrDeliverySettled`. If a processor returns or
-panics without settling, the delivery remains pending in the backend (the lease eventually expires
-and the backend redelivers it). To observe — and optionally handle — such cases:
+panics without settling, the delivery remains pending in the driver (the lease eventually expires
+and the driver redelivers it). To observe — and optionally handle — such cases:
 
 ```go
-jobs, err := queue.NewStore(backendFor, process, policy,
+jobs, err := queue.NewStore(driverFor, process, policy,
     queue.WithUnsettledProcessor(
         func(ctx context.Context, id int, delivery queue.Delivery[Job], cause queue.UnsettledCause) {
             log.Warn("unsettled delivery",
@@ -279,7 +279,7 @@ jobs, err := queue.NewStore(backendFor, process, policy,
 `cause.Kind` is `queue.UnsettledReturned` or `queue.UnsettledPanicked` (with the recovered value in
 `cause.Panic`).
 
-## Backends
+## Drivers
 
 ### memory (process-local)
 
@@ -288,7 +288,7 @@ jobs, err := queue.NewStore(backendFor, process, policy,
 by timers. State is lost on restart — suitable for tests and re-creatable work.
 
 ```go
-backend := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
+driver := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
 ```
 
 ### beanstalk (durable)
@@ -297,7 +297,7 @@ backend := memory.New[Job](memory.Options{AckWait: 30 * time.Second})
 (producer and consumer) and reconnects them automatically on network errors.
 
 ```go
-backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], error) {
+driverFor := func(ctx context.Context, accountID int) (queue.Driver[Job], error) {
     // Each executor needs its own manager because a manager is bound to one tube.
     tube := fmt.Sprintf("transport.%d.jobs", accountID)
     manager, err := beanstalk.NewManager(ctx, "beanstalkd:11300", tube, log, time.Second)
@@ -328,7 +328,7 @@ if err != nil {
     return err
 }
 
-backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], error) {
+driverFor := func(ctx context.Context, accountID int) (queue.Driver[Job], error) {
     return nats.New[Job](ctx, client, queue.JSONCodec[Job]{}, nats.Config{
         Subject: fmt.Sprintf("transport.%d.jobs", accountID),
         Stream: jetstream.StreamConfig{
@@ -341,9 +341,9 @@ backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], erro
 }
 ```
 
-Create the shared NATS client once at application startup, pass it to every backend constructor, stop
+Create the shared NATS client once at application startup, pass it to every driver constructor, stop
 the queue store first during shutdown, and then call `client.Drain(shutdownCtx)`. Closing a queue
-backend does not close the shared client.
+driver does not close the shared client.
 
 The enqueue ID is used as the JetStream message ID, giving publisher-side deduplication. `Stats` maps
 consumer pending (Ready), scheduled messages (Deferred), and unacknowledged deliveries (InFlight).
@@ -366,7 +366,7 @@ if err := handle(ctx, delivery.Value()); err != nil {
 
 ### Codecs
 
-Persistent backends serialize items with a `queue.Codec[T]`:
+Persistent drivers serialize items with a `queue.Codec[T]`:
 
 - `queue.JSONCodec[T]{}` — encoding/json/v2, the default choice.
 - `queue.BytesCodec{}` — pass-through for already-encoded payloads.
@@ -398,7 +398,7 @@ if err := jobs.Reconcile(ctx, accounts); err != nil {
 ```
 
 Executors for accounts missing from the list are closed and removed; new accounts get executors
-lazily or eagerly, created through the backend constructor.
+lazily or eagerly, created through the driver constructor.
 
 ## Observability
 
@@ -419,7 +419,7 @@ jobs.CloseIntake()              // 1. reject new enqueues (ErrIntakeClosed from 
 if err := jobs.Drain(ctx); err != nil { // 2. wait until queues are empty
     return err
 }
-return jobs.Stop(ctx)           // 3. cancel workers, close backends
+return jobs.Stop(ctx)           // 3. cancel workers, close drivers
 ```
 
 `Executor` exposes the same phases for a single queue (`CloseIntake`, `Drain`, `Close`). `Stop` is

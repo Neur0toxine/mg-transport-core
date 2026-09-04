@@ -103,14 +103,14 @@ See [NATS integration](nats.md).
 
 ## core/queue
 
-- `NewStore(backendFor, processor, policy, opts...)` — one executor per queue ID; `Enqueue`, `Get`,
+- `NewStore(driverFor, processor, policy, opts...)` — one executor per queue ID; `Enqueue`, `Get`,
   `Info`, `Has`, `Reconcile`, `Remove`, `Stats`, `Drain`, `CloseIntake`, `Stop`.
 - `Delivery[T]` — `Value`, `Metadata`, `Ack`, `Requeue`, `Reject`, `Touch`, `Settled`.
 - `WorkerPolicy` — scaling bounds and timing; `DesiredWorkersFunc` for custom scaling.
 - Options: `WithID`, `WithDelay`, `WithNotBefore`; store options `WithPanicHandler`,
   `WithUnsettledProcessor`, `WithWorkerFactory`.
 - Codecs: `JSONCodec[T]`, `BytesCodec`, `FuncCodec[T]` (hydrate runtime dependencies on decode).
-- Backends: [`queue/memory`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/queue/memory)
+- Drivers: [`queue/memory`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/queue/memory)
   (process-local), [`queue/beanstalk`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/queue/beanstalk)
   (beanstalkd, auto-reconnecting `Manager`), [`queue/nats`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/queue/nats)
   (JetStream stream + durable consumer + message schedules).
@@ -148,8 +148,8 @@ Pass traced errors to `Sentry.CaptureException` for meaningful reports.
 
 ## core/cache
 
-- `New(backend) *Cache[K, V]` — typed facade: `Get`, `Set`, `Has`, `Delete`, `Clear`, `Len`, `Close`.
-- `Backend[K, V]` interface — implemented by
+- `New(driver) *Cache[K, V]` — typed facade: `Get`, `Set`, `Has`, `Delete`, `Clear`, `Len`, `Close`.
+- `Driver[K, V]` interface — implemented by
   [`cache/memory`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/cache/memory)
   (otter, capacity + write TTL) and
   [`cache/nats`](https://pkg.go.dev/github.com/retailcrm/mg-transport-core/v2/core/cache/nats)

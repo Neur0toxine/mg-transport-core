@@ -29,7 +29,7 @@ func TestStoreConstructsEachIDOnceWithoutSerializingDifferentIDs(t *testing.T) {
 	var calls atomic.Int32
 	started := make(chan int, 2)
 	release := make(chan struct{})
-	constructor := func(_ context.Context, id int) (queue.Backend[int], error) {
+	constructor := func(_ context.Context, id int) (queue.Driver[int], error) {
 		calls.Add(1)
 		started <- id
 		<-release
@@ -54,7 +54,7 @@ func TestStoreConstructsEachIDOnceWithoutSerializingDifferentIDs(t *testing.T) {
 		case id := <-started:
 			seen[id] = true
 		case <-time.After(time.Second):
-			t.Fatal("backend construction was serialized across queue IDs")
+			t.Fatal("driver construction was serialized across queue IDs")
 		}
 	}
 	close(release)
@@ -74,13 +74,13 @@ func TestStoreConstructsEachIDOnceWithoutSerializingDifferentIDs(t *testing.T) {
 }
 
 func TestStoreScalesForJobsPublishedOutsideExecutor(t *testing.T) {
-	var backend *memory.Memory[int]
+	var driver *memory.Memory[int]
 	processed := make(chan int, 1)
 	policy := testWorkerPolicy()
 	policy.MinWorkers = 0
-	store, err := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
-		backend = memory.New[int](memory.Options{})
-		return backend, nil
+	store, err := queue.NewStore(func(context.Context, int) (queue.Driver[int], error) {
+		driver = memory.New[int](memory.Options{})
+		return driver, nil
 	}, func(ctx context.Context, id int, delivery queue.Delivery[int]) {
 		assert.Equal(t, 7, id)
 		processed <- delivery.Value()
@@ -91,12 +91,12 @@ func TestStoreScalesForJobsPublishedOutsideExecutor(t *testing.T) {
 
 	_, err = store.Get(t.Context(), 7)
 	require.NoError(t, err)
-	require.NoError(t, backend.Enqueue(t.Context(), 42, queue.EnqueueOptions{}))
+	require.NoError(t, driver.Enqueue(t.Context(), 42, queue.EnqueueOptions{}))
 	select {
 	case value := <-processed:
 		assert.Equal(t, 42, value)
 	case <-time.After(time.Second):
-		t.Fatal("periodic scaling did not discover the backend job")
+		t.Fatal("periodic scaling did not discover the driver job")
 	}
 }
 
@@ -106,7 +106,7 @@ func TestStoreScalesUpAndRetiresIdleWorkers(t *testing.T) {
 	policy := testWorkerPolicy()
 	policy.MaxWorkers = 3
 	policy.IdleTimeout = 20 * time.Millisecond
-	store, err := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
+	store, err := queue.NewStore(func(context.Context, int) (queue.Driver[int], error) {
 		return memory.New[int](memory.Options{}), nil
 	}, func(ctx context.Context, _ int, delivery queue.Delivery[int]) {
 		started <- struct{}{}
@@ -138,7 +138,7 @@ func TestStoreScalesUpAndRetiresIdleWorkers(t *testing.T) {
 }
 
 func TestStoreReconcileCreatesAndRemovesExecutors(t *testing.T) {
-	store, err := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
+	store, err := queue.NewStore(func(context.Context, int) (queue.Driver[int], error) {
 		return memory.New[int](memory.Options{}), nil
 	}, func(ctx context.Context, _ int, delivery queue.Delivery[int]) {
 		require.NoError(t, delivery.Ack(ctx))
@@ -177,7 +177,7 @@ func (waitingWorker) Run(ctx context.Context) queue.WorkerResult {
 func TestStoreRestartsMinimumWorkerAfterWorkerPanic(t *testing.T) {
 	var factoryCalls atomic.Int32
 	store, err := queue.NewStore(
-		func(context.Context, int) (queue.Backend[int], error) {
+		func(context.Context, int) (queue.Driver[int], error) {
 			return memory.New[int](memory.Options{}), nil
 		},
 		func(context.Context, int, queue.Delivery[int]) {},
@@ -208,7 +208,7 @@ func TestStoreUsesCustomDesiredWorkerPolicy(t *testing.T) {
 		assert.Equal(t, 9, info.ID)
 		return 100
 	}
-	store, err := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
+	store, err := queue.NewStore(func(context.Context, int) (queue.Driver[int], error) {
 		return memory.New[int](memory.Options{}), nil
 	}, func(context.Context, int, queue.Delivery[int]) {}, policy)
 	require.NoError(t, err)
@@ -222,20 +222,20 @@ func TestStoreUsesCustomDesiredWorkerPolicy(t *testing.T) {
 }
 
 func TestNewStoreValidatesPolicy(t *testing.T) {
-	constructor := func(context.Context, int) (queue.Backend[int], error) {
+	constructor := func(context.Context, int) (queue.Driver[int], error) {
 		return memory.New[int](memory.Options{}), nil
 	}
 	processor := func(context.Context, int, queue.Delivery[int]) {}
 	_, err := queue.NewStore(constructor, processor, queue.WorkerPolicy{})
 	require.EqualError(t, err, "max workers must be at least 1")
 	_, err = queue.NewStore[int](nil, processor, testWorkerPolicy())
-	require.EqualError(t, err, "backend constructor is required")
+	require.EqualError(t, err, "driver constructor is required")
 	_, err = queue.NewStore(constructor, nil, testWorkerPolicy())
 	require.EqualError(t, err, "processor is required")
-	store, err := queue.NewStore(func(context.Context, int) (queue.Backend[int], error) {
+	store, err := queue.NewStore(func(context.Context, int) (queue.Driver[int], error) {
 		return nil, nil
 	}, processor, testWorkerPolicy())
 	require.NoError(t, err)
 	_, err = store.Get(t.Context(), 1)
-	require.EqualError(t, err, "backend constructor returned nil backend")
+	require.EqualError(t, err, "driver constructor returned nil driver")
 }

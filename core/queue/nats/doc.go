@@ -1,19 +1,19 @@
-// Package nats provides a queue.Backend implementation backed by NATS JetStream.
+// Package nats provides a queue.Driver implementation backed by NATS JetStream.
 //
 // # Architecture
 //
-// The backend uses one JetStream stream and one durable pull consumer. Ready items are published to
+// The driver uses one JetStream stream and one durable pull consumer. Ready items are published to
 // the queue subject and delivered through the consumer with explicit acknowledgments. Deferred items
 // (WithDelay/WithNotBefore) normally rely on JetStream message schedules: the item is published under
 // "<ScheduleSubject>.<token>" with a schedule-at time and a target pointing at the queue subject, so
 // the server itself moves the item into place when it becomes due. This requires the stream to be
-// created with AllowMsgSchedules enabled; the backend refuses to bind to a stream without it. Set
+// created with AllowMsgSchedules enabled; the driver refuses to bind to a stream without it. Set
 // DisableScheduling to bind a legacy stream without this feature; delayed negative acknowledgments
 // still work, while delayed enqueue returns queue.ErrSchedulingUnsupported.
 //
 // By default, items are wrapped into an envelope (delivery ID, enqueue timestamp, encoded payload).
 // PayloadRaw stores only the queue.Codec output and derives metadata from the NATS header and stream
-// metadata, allowing a backend to consume messages from legacy direct publishers. The caller-provided
+// metadata, allowing a driver to consume messages from legacy direct publishers. The caller-provided
 // enqueue ID doubles as the JetStream message ID, giving
 // publisher-side deduplication for free. Delivery leases map to the consumer acknowledgment wait:
 // Touch sends in-progress working acknowledgments, Requeue maps to a negative acknowledgment with
@@ -32,12 +32,12 @@
 //	if err != nil {
 //	    return err
 //	}
-//	backend, err := nats.New[Job](ctx, client, queue.JSONCodec[Job]{}, nats.Config{
+//	driver, err := nats.New[Job](ctx, client, queue.JSONCodec[Job]{}, nats.Config{
 //	    Subject:   "transport.jobs",
 //	    Stream:    jetstream.StreamConfig{Name: "TRANSPORT", AllowMsgSchedules: true},
 //	    Consumer:  jetstream.ConsumerConfig{Name: "transport-jobs"},
 //	    Provision: nats.Ensure,
 //	})
 //
-// The backend is durable: undelivered and unsettled items survive restarts inside JetStream.
+// The driver is durable: undelivered and unsettled items survive restarts inside JetStream.
 package nats

@@ -30,10 +30,10 @@ func startServer(t *testing.T) *corenats.Client {
 	return client
 }
 
-func TestBackendLifecycleAndScheduling(t *testing.T) {
+func TestDriverLifecycleAndScheduling(t *testing.T) {
 	client := startServer(t)
 
-	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+	driver, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "jobs.ready", ScheduleSubject: "jobs.schedule", Provision: Ensure,
 		Stream: jetstream.StreamConfig{
 			Name: "JOBS", Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
@@ -42,7 +42,7 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 		FetchMaxWait: 20 * time.Millisecond,
 	})
 	require.NoError(t, err)
-	q := queue.New(1, backend)
+	q := queue.New(1, driver)
 	require.NoError(t, q.Enqueue(t.Context(), "now", queue.WithID("transport-message-id")))
 	require.NoError(t, q.Enqueue(t.Context(), "later", queue.WithID("scheduled id with spaces"),
 		queue.WithDelay(100*time.Millisecond)))
@@ -67,7 +67,7 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	assert.Equal(t, "later", delivery.Value())
 	assert.Equal(t, "scheduled id with spaces", delivery.Metadata().ID)
 	require.NoError(t, delivery.Reject(t.Context()))
-	require.NoError(t, backend.Close(t.Context()))
+	require.NoError(t, driver.Close(t.Context()))
 
 	_, err = New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "jobs.ready", ScheduleSubject: "jobs.schedule", Provision: BindExisting,
@@ -78,7 +78,7 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 
 func TestRawPayloadAndDisabledScheduling(t *testing.T) {
 	client := startServer(t)
-	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+	driver, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "legacy.task.outbound.42", PayloadMode: PayloadRaw, DisableScheduling: true, Provision: Ensure,
 		Stream: jetstream.StreamConfig{
 			Name: "LEGACY_TASKS", Subjects: []string{"legacy.task.>"},
@@ -94,18 +94,18 @@ func TestRawPayloadAndDisabledScheduling(t *testing.T) {
 	_, err = client.JetStream.PublishMsg(t.Context(), message)
 	require.NoError(t, err)
 
-	delivery, err := backend.Dequeue(t.Context())
+	delivery, err := driver.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "already queued", delivery.Value())
 	assert.Equal(t, "legacy-id", delivery.Metadata().ID)
 	assert.False(t, delivery.Metadata().EnqueuedAt.IsZero())
 	require.NoError(t, delivery.Requeue(t.Context(), 10*time.Millisecond))
-	delivery, err = backend.Dequeue(t.Context())
+	delivery, err = driver.Dequeue(t.Context())
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, delivery.Metadata().Attempt, uint64(2))
 	require.NoError(t, delivery.Ack(t.Context()))
 
-	q := queue.New(42, backend)
+	q := queue.New(42, driver)
 	err = q.Enqueue(t.Context(), "delayed", queue.WithDelay(time.Second))
 	require.ErrorIs(t, err, queue.ErrSchedulingUnsupported)
 	require.NoError(t, q.Enqueue(t.Context(), "direct", queue.WithID("direct-id")))
@@ -126,7 +126,7 @@ func TestDeadLetterMalformedAndRejectedDeliveries(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, client.Conn.Flush())
 
-	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+	driver, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "legacy.task.outbound.42", PayloadMode: PayloadRaw, DisableScheduling: true, Provision: Ensure,
 		Stream: jetstream.StreamConfig{
 			Name: "LEGACY_TASKS_DLQ_TEST", Subjects: []string{"legacy.task.>"},
@@ -147,7 +147,7 @@ func TestDeadLetterMalformedAndRejectedDeliveries(t *testing.T) {
 	malformed.Header.Set("Original", "header")
 	_, err = client.JetStream.PublishMsg(t.Context(), malformed)
 	require.NoError(t, err)
-	_, err = backend.Dequeue(t.Context())
+	_, err = driver.Dequeue(t.Context())
 	require.ErrorContains(t, err, "decode NATS delivery")
 	deadLetter := nextMessage(t, dlqSubscription)
 	assert.Equal(t, malformed.Data, deadLetter.Data)
@@ -155,7 +155,7 @@ func TestDeadLetterMalformedAndRejectedDeliveries(t *testing.T) {
 	assert.Equal(t, malformed.Subject, deadLetter.Header.Get("X-Original-Subject"))
 	assert.Contains(t, deadLetter.Header.Get("X-Error"), "decode NATS delivery")
 
-	q := queue.New(42, backend)
+	q := queue.New(42, driver)
 	require.NoError(t, q.Enqueue(t.Context(), "valid", queue.WithID("valid-id")))
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)
@@ -181,7 +181,7 @@ func TestDeadLetterMalformedAndRejectedDeliveries(t *testing.T) {
 
 func TestFailedDeadLetterDoesNotSettleDelivery(t *testing.T) {
 	client := startServer(t)
-	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+	driver, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "failed.task", DisableScheduling: true, Provision: Ensure,
 		Stream: jetstream.StreamConfig{
 			Name: "FAILED_TASK", Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
@@ -193,7 +193,7 @@ func TestFailedDeadLetterDoesNotSettleDelivery(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	q := queue.New(1, backend)
+	q := queue.New(1, driver)
 	require.NoError(t, q.Enqueue(t.Context(), "payload"))
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)

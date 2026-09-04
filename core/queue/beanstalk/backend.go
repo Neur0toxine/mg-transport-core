@@ -12,7 +12,7 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
-// Options configures a beanstalk backend.
+// Options configures a beanstalk driver.
 type Options struct {
 	// Priority is the beanstalkd job priority used on Put and Release; lower values mean higher priority.
 	Priority uint32
@@ -24,8 +24,8 @@ type Options struct {
 	PollTimeout time.Duration
 }
 
-// Backend is a queue.Backend implementation on top of a beanstalkd tube managed by a Manager.
-type Backend[T any] struct {
+// Driver is a queue.Driver implementation on top of a beanstalkd tube managed by a Manager.
+type Driver[T any] struct {
 	manager ManagerInterface
 	codec   queue.Codec[T]
 	options Options
@@ -38,21 +38,21 @@ type envelope struct {
 	Payload    []byte    `json:"payload"`
 }
 
-// New creates a beanstalk backend over the given manager. The codec serializes items into the
+// New creates a beanstalk driver over the given manager. The codec serializes items into the
 // beanstalkd job body wrapped into an envelope with the delivery ID and enqueue timestamp.
-func New[T any](manager ManagerInterface, codec queue.Codec[T], options Options) *Backend[T] {
+func New[T any](manager ManagerInterface, codec queue.Codec[T], options Options) *Driver[T] {
 	if options.TTR <= 0 {
 		options.TTR = time.Minute
 	}
 	if options.PollTimeout <= 0 {
 		options.PollTimeout = time.Second
 	}
-	return &Backend[T]{manager: manager, codec: codec, options: options}
+	return &Driver[T]{manager: manager, codec: codec, options: options}
 }
 
 // Enqueue encodes the item and puts it into the tube, using native beanstalkd delays for deferred
 // items.
-func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
+func (b *Driver[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 
 // Dequeue reserves the next job from the tube. Jobs whose envelope or payload cannot be decoded are
 // deleted; the error is returned to the caller, and the next Dequeue attempt fetches the following job.
-func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
+func (b *Driver[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -103,12 +103,12 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 			_ = b.manager.Release(id, b.options.Priority, 0)
 			return nil, fmt.Errorf("read beanstalk delivery metadata: %w", err)
 		}
-		return &delivery[T]{backend: b, jobID: id, value: value, metadata: queue.Metadata{ID: message.ID, EnqueuedAt: message.EnqueuedAt, DeliveredAt: time.Now(), Attempt: attempt}}, nil
+		return &delivery[T]{driver: b, jobID: id, value: value, metadata: queue.Metadata{ID: message.ID, EnqueuedAt: message.EnqueuedAt, DeliveredAt: time.Now(), Attempt: attempt}}, nil
 	}
 }
 
 // Stats maps tube statistics to the queue counters: ready, delayed, and reserved jobs.
-func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
+func (b *Driver[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	if err := ctx.Err(); err != nil {
 		return queue.Stats{}, err
 	}
@@ -116,15 +116,15 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	return queue.Stats{Ready: stats.Ready, Deferred: stats.Delayed, InFlight: stats.Reserved}, err
 }
 
-// Close marks the backend closed and closes the underlying manager connections. Jobs remaining in the
+// Close marks the driver closed and closes the underlying manager connections. Jobs remaining in the
 // tube are kept by the server for later consumption.
-func (b *Backend[T]) Close(context.Context) error {
+func (b *Driver[T]) Close(context.Context) error {
 	b.closed.Store(true)
 	return b.manager.Close()
 }
 
 type delivery[T any] struct {
-	backend  *Backend[T]
+	driver   *Driver[T]
 	jobID    uint64
 	value    T
 	metadata queue.Metadata
@@ -153,7 +153,7 @@ func (d *delivery[T]) terminal(operation func() error) error {
 	return nil
 }
 func (d *delivery[T]) Ack(context.Context) error {
-	return d.terminal(func() error { return d.backend.manager.Delete(d.jobID) })
+	return d.terminal(func() error { return d.driver.manager.Delete(d.jobID) })
 }
 func (d *delivery[T]) Reject(ctx context.Context) error {
 	return d.Ack(ctx)
@@ -162,7 +162,7 @@ func (d *delivery[T]) Requeue(ctx context.Context, delay time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return d.terminal(func() error { return d.backend.manager.Release(d.jobID, d.backend.options.Priority, delay) })
+	return d.terminal(func() error { return d.driver.manager.Release(d.jobID, d.driver.options.Priority, delay) })
 }
 func (d *delivery[T]) Touch(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -171,7 +171,7 @@ func (d *delivery[T]) Touch(ctx context.Context) error {
 	if d.Settled() {
 		return queue.ErrDeliverySettled
 	}
-	return d.backend.manager.Touch(d.jobID)
+	return d.driver.manager.Touch(d.jobID)
 }
 
-var _ queue.Backend[int] = (*Backend[int])(nil)
+var _ queue.Driver[int] = (*Driver[int])(nil)

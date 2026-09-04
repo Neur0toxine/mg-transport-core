@@ -39,15 +39,15 @@ func startNATS(t *testing.T) *corenats.Client {
 	return client
 }
 
-func newBackend(
+func newDriver(
 	t *testing.T,
 	client *corenats.Client,
 	bucket string,
 	provision cachenats.ProvisionMode,
 	ttl time.Duration,
-) *cachenats.Backend[int, string] {
+) *cachenats.Driver[int, string] {
 	t.Helper()
-	backend, err := cachenats.New(
+	driver, err := cachenats.New(
 		t.Context(),
 		client,
 		cache.JSONKeyEncoder[int]{},
@@ -62,13 +62,13 @@ func newBackend(
 		},
 	)
 	require.NoError(t, err)
-	return backend
+	return driver
 }
 
-func TestBackendLifecycleAndVisibility(t *testing.T) {
+func TestDriverLifecycleAndVisibility(t *testing.T) {
 	client := startNATS(t)
-	first := newBackend(t, client, "CACHE_LIFECYCLE", cachenats.Ensure, 0)
-	second := newBackend(t, client, "CACHE_LIFECYCLE", cachenats.BindExisting, 0)
+	first := newDriver(t, client, "CACHE_LIFECYCLE", cachenats.Ensure, 0)
+	second := newDriver(t, client, "CACHE_LIFECYCLE", cachenats.BindExisting, 0)
 
 	value, found, err := first.Get(t.Context(), 404)
 	require.NoError(t, err)
@@ -102,7 +102,7 @@ func TestBackendLifecycleAndVisibility(t *testing.T) {
 	require.NoError(t, first.Close(t.Context()))
 	require.ErrorIs(t, first.Set(t.Context(), 3, "closed"), cache.ErrClosed)
 
-	// Closing a backend must not close its shared client or remove its bucket.
+	// Closing a driver must not close its shared client or remove its bucket.
 	require.NoError(t, second.Set(t.Context(), 3, "still open"))
 	value, found, err = second.Get(t.Context(), 3)
 	require.NoError(t, err)
@@ -110,29 +110,29 @@ func TestBackendLifecycleAndVisibility(t *testing.T) {
 	assert.Equal(t, "still open", value)
 }
 
-func TestBackendExpiresAfterLastSet(t *testing.T) {
+func TestDriverExpiresAfterLastSet(t *testing.T) {
 	client := startNATS(t)
-	backend := newBackend(t, client, "CACHE_TTL", cachenats.Ensure, 200*time.Millisecond)
+	driver := newDriver(t, client, "CACHE_TTL", cachenats.Ensure, 200*time.Millisecond)
 
-	require.NoError(t, backend.Set(t.Context(), 1, "first"))
+	require.NoError(t, driver.Set(t.Context(), 1, "first"))
 	time.Sleep(125 * time.Millisecond)
-	require.NoError(t, backend.Set(t.Context(), 1, "second"))
+	require.NoError(t, driver.Set(t.Context(), 1, "second"))
 	time.Sleep(125 * time.Millisecond)
 
-	value, found, err := backend.Get(t.Context(), 1)
+	value, found, err := driver.Get(t.Context(), 1)
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, "second", value)
 
 	require.Eventually(t, func() bool {
-		_, found, getErr := backend.Get(t.Context(), 1)
+		_, found, getErr := driver.Get(t.Context(), 1)
 		return getErr == nil && !found
 	}, 2*time.Second, 20*time.Millisecond)
 }
 
 func TestBindValidatesTTL(t *testing.T) {
 	client := startNATS(t)
-	_ = newBackend(t, client, "CACHE_BIND", cachenats.Ensure, time.Second)
+	_ = newDriver(t, client, "CACHE_BIND", cachenats.Ensure, time.Second)
 
 	_, err := cachenats.New(
 		t.Context(),
@@ -144,7 +144,7 @@ func TestBindValidatesTTL(t *testing.T) {
 	require.ErrorContains(t, err, "TTL")
 }
 
-func TestBackendValidation(t *testing.T) {
+func TestDriverValidation(t *testing.T) {
 	client := startNATS(t)
 	config := cachenats.Config{Bucket: jetstream.KeyValueConfig{Bucket: "VALIDATION"}, Provision: cachenats.Ensure}
 
@@ -180,7 +180,7 @@ func (failingCodec) Decode([]byte) (string, error) {
 	return "", errors.New("value failure")
 }
 
-func TestBackendReportsCodecErrors(t *testing.T) {
+func TestDriverReportsCodecErrors(t *testing.T) {
 	client := startNATS(t)
 	config := cachenats.Config{
 		Bucket:    jetstream.KeyValueConfig{Bucket: "CACHE_CODEC", Storage: jetstream.MemoryStorage},
@@ -195,18 +195,18 @@ func TestBackendReportsCodecErrors(t *testing.T) {
 	require.ErrorContains(t, badValue.Set(t.Context(), "key", "value"), "encode NATS cache value")
 }
 
-func TestBackendHonorsContext(t *testing.T) {
+func TestDriverHonorsContext(t *testing.T) {
 	client := startNATS(t)
-	backend := newBackend(t, client, "CACHE_CONTEXT", cachenats.Ensure, 0)
+	driver := newDriver(t, client, "CACHE_CONTEXT", cachenats.Ensure, 0)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, backend.Set(ctx, 1, "value"), context.Canceled)
+	require.ErrorIs(t, driver.Set(ctx, 1, "value"), context.Canceled)
 }
 
-func TestVersionedBackendLifecycle(t *testing.T) {
+func TestVersionedDriverLifecycle(t *testing.T) {
 	client := startNATS(t)
-	backend := newBackend(t, client, "CACHE_VERSIONED", cachenats.Ensure, 0)
-	versioned := cache.NewVersioned[int, string](backend)
+	driver := newDriver(t, client, "CACHE_VERSIONED", cachenats.Ensure, 0)
+	versioned := cache.NewVersioned[int, string](driver)
 
 	entry, found, err := versioned.GetEntry(t.Context(), 1)
 	require.NoError(t, err)
@@ -241,10 +241,10 @@ func TestVersionedBackendLifecycle(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestVersionedBackendKeys(t *testing.T) {
+func TestVersionedDriverKeys(t *testing.T) {
 	client := startNATS(t)
-	backend := newBackend(t, client, "CACHE_KEYS", cachenats.Ensure, 0)
-	versioned := cache.NewVersioned[int, string](backend)
+	driver := newDriver(t, client, "CACHE_KEYS", cachenats.Ensure, 0)
+	versioned := cache.NewVersioned[int, string](driver)
 
 	keys, err := versioned.Keys(t.Context())
 	require.NoError(t, err)
@@ -259,14 +259,14 @@ func TestVersionedBackendKeys(t *testing.T) {
 	assert.Equal(t, []int{1, 2}, keys)
 }
 
-func TestVersionedBackendRequiresKeyDecoderForKeys(t *testing.T) {
+func TestVersionedDriverRequiresKeyDecoderForKeys(t *testing.T) {
 	client := startNATS(t)
 	config := cachenats.Config{
 		Bucket:    jetstream.KeyValueConfig{Bucket: "CACHE_KEYS_ENCODER", Storage: jetstream.MemoryStorage},
 		Provision: cachenats.Ensure,
 	}
-	backend, err := cachenats.New(t.Context(), client, failingKeyEncoder{}, cache.JSONCodec[string]{}, config)
+	driver, err := cachenats.New(t.Context(), client, failingKeyEncoder{}, cache.JSONCodec[string]{}, config)
 	require.NoError(t, err)
-	_, err = backend.Keys(t.Context())
+	_, err = driver.Keys(t.Context())
 	require.ErrorIs(t, err, cache.ErrKeyDecodingUnsupported)
 }

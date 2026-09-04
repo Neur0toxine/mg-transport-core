@@ -1,8 +1,8 @@
 # Cache
 
 The `core/cache` package (with the `core/cache/memory` and `core/cache/nats` subpackages) provides a
-typed cache facade over interchangeable backends. Values and keys stay typed in transport code;
-storage details (encoding, TTL semantics, sharing) are a backend concern.
+typed cache facade over interchangeable drivers. Values and keys stay typed in transport code;
+storage details (encoding, TTL semantics, sharing) are a driver concern.
 
 ## The facade
 
@@ -12,14 +12,14 @@ type VersionedCache[K comparable, V any] // Cache plus revisions / CAS / typed k
 ```
 
 ```go
-backend, err := memory.New[int, Account](memory.Options{
+driver, err := memory.New[int, Account](memory.Options{
     Capacity: 1_000,
     TTL:      time.Hour,
 })
 if err != nil {
     return err
 }
-accounts := cache.New(backend)
+accounts := cache.New(driver)
 
 _ = accounts.Set(ctx, account.ID, account)
 account, found, err := accounts.Get(ctx, accountID)
@@ -67,14 +67,14 @@ type AccountService struct {
 }
 
 func NewAccountService(repository AccountRepository) (*AccountService, error) {
-    backend, err := memory.New[int, Account](memory.Options{
+    driver, err := memory.New[int, Account](memory.Options{
         Capacity: 1_000,
         TTL:      10 * time.Minute,
     })
     if err != nil {
         return nil, err
     }
-    return &AccountService{repository: repository, accounts: cache.New(backend)}, nil
+    return &AccountService{repository: repository, accounts: cache.New(driver)}, nil
 }
 
 func (s *AccountService) Account(ctx context.Context, id int) (Account, error) {
@@ -112,7 +112,7 @@ Concurrent misses may call `Find` more than once; add application-level request 
 expensive. Cache failures are treated as request failures above. For a best-effort cache, log `Get`,
 `Set`, or `Delete` errors and continue to the repository instead.
 
-## Backends
+## Drivers
 
 ### memory — process-local
 
@@ -121,20 +121,20 @@ expensive. Cache failures are treated as request failures above. For a best-effo
 | `Capacity` | Hard entry limit; must be positive. Excess writes evict via the otter admission policy. |
 | `TTL` | Entries expire this long *after being written*. Zero disables expiry. |
 
-The backend is built on the [otter] cache (S3-FIFO), is lock-free, and never blocks on I/O. Entries do
+The driver is built on the [otter] cache (S3-FIFO), is lock-free, and never blocks on I/O. Entries do
 not survive restarts and are invisible to other replicas — use it for re-computable, per-instance data
 (connection objects, resolved tokens, idempotent API responses).
 
 ```mermaid
 flowchart LR
     subgraph process["Transport replica"]
-        C1["Cache[int, Account]"] --> M1["memory.Backend<br/>otter, capacity, write TTL"]
+        C1["Cache[int, Account]"] --> M1["memory.Driver<br/>otter, capacity, write TTL"]
     end
 ```
 
 ### nats — JetStream KV bucket, shared
 
-The NATS backend stores entries in a JetStream key-value bucket. Every process using the same bucket
+The NATS driver stores entries in a JetStream key-value bucket. Every process using the same bucket
 and client sees the same data, which makes it a building block for cross-replica caches.
 
 ```go
@@ -143,7 +143,7 @@ if err != nil {
     return err
 }
 
-backend, err := nats.New[int, Account](
+driver, err := nats.New[int, Account](
     ctx, client,
     cache.JSONKeyEncoder[int]{},   // int keys -> base64(JSON) bucket keys
     cache.JSONCodec[Account]{},    // Account -> JSON bytes
@@ -155,7 +155,7 @@ backend, err := nats.New[int, Account](
 if err != nil {
     return err
 }
-accounts := cache.New[int, Account](backend)
+accounts := cache.New[int, Account](driver)
 defer func() { _ = accounts.Close(context.WithoutCancel(ctx)) }()
 
 if err := accounts.Set(ctx, account.ID, account); err != nil {
@@ -169,17 +169,17 @@ Properties to be aware of:
 - **TTL is bucket-wide.** The server expires every entry after the bucket's TTL; per-entry TTL is not
   possible. `Provision: BindExisting` validates that the existing bucket's TTL matches the configured
   one and refuses to bind otherwise; `Ensure` creates or updates the bucket (and its TTL).
-- **Reads hit the server.** The backend does not watch for updates; a value written by another
+- **Reads hit the server.** The driver does not watch for updates; a value written by another
   process becomes visible on the next operation.
 - **Delete purges** the key so per-key history does not accumulate in the underlying stream.
-- **Closing is local.** `Close` only marks the backend closed; the shared NATS client and the bucket
+- **Closing is local.** `Close` only marks the driver closed; the shared NATS client and the bucket
   itself are untouched.
 
-For shared mutable state, wrap the same backend with `cache.NewVersioned`. `Create` reserves an absent
+For shared mutable state, wrap the same driver with `cache.NewVersioned`. `Create` reserves an absent
 key, `GetEntry` returns its revision, and `Update` / `DeleteRevision` perform optimistic concurrency:
 
 ```go
-state := cache.NewVersioned[string, DeliveryState](backend)
+state := cache.NewVersioned[string, DeliveryState](driver)
 revision, err := state.Create(ctx, deliveryID, initial)
 if errors.Is(err, cache.ErrConflict) {
     current, found, err := state.GetEntry(ctx, deliveryID)
@@ -216,7 +216,7 @@ func markCompleted(ctx context.Context, state *cache.VersionedCache[string, Deli
 ```
 
 Use the ordinary facade for disposable cached data and the versioned facade only when the KV bucket
-is acting as shared mutable state. The memory backend does not implement revisions.
+is acting as shared mutable state. The memory driver does not implement revisions.
 
 `BindExisting` validates TTL, history, replicas, and storage. `Keys` requires a key converter that
 also implements `cache.KeyDecoder`; both built-in key encoders do.
@@ -224,18 +224,18 @@ also implements `cache.KeyDecoder`; both built-in key encoders do.
 ```mermaid
 flowchart LR
     subgraph replica1["Replica A"]
-        CA["Cache[int, Account]"] --> NA["cache/nats.Backend"]
+        CA["Cache[int, Account]"] --> NA["cache/nats.Driver"]
     end
     subgraph replica2["Replica B"]
-        CB["Cache[int, Account]"] --> NB["cache/nats.Backend"]
+        CB["Cache[int, Account]"] --> NB["cache/nats.Driver"]
     end
     NA --> KV["JetStream KV bucket<br/>TTL: 1h"]
     NB --> KV
 ```
 
-## Keys and values on persistent backends
+## Keys and values on persistent drivers
 
-Bucket keys are strings and stored values are bytes, so the NATS backend takes two converters:
+Bucket keys are strings and stored values are bytes, so the NATS driver takes two converters:
 
 | Converter | Behavior |
 |---|---|
@@ -250,7 +250,7 @@ Custom encodings plug in by implementing `cache.KeyEncoder[K]` or `cache.Codec[V
 For data already encoded by the application, no JSON layer is needed:
 
 ```go
-backend, err := nats.New[string, []byte](
+driver, err := nats.New[string, []byte](
     ctx, client,
     cache.StringKeyEncoder{},
     cache.BytesCodec{},
@@ -262,19 +262,19 @@ backend, err := nats.New[string, []byte](
 if err != nil {
     return err
 }
-rendered := cache.New[string, []byte](backend)
+rendered := cache.New[string, []byte](driver)
 if err := rendered.Set(ctx, templateID, encodedMessage); err != nil {
     return err
 }
 encodedMessage, found, err = rendered.Get(ctx, templateID)
 ```
 
-`BytesCodec` clones byte slices while encoding and decoding, so callers do not share the backend's
+`BytesCodec` clones byte slices while encoding and decoding, so callers do not share the driver's
 storage buffer.
 
-## Choosing a backend
+## Choosing a driver
 
-| Need | Backend |
+| Need | Driver |
 |---|---|
 | Cheap per-instance cache, misses re-computable | `memory` |
 | Shared across replicas / survive restarts | `nats` |

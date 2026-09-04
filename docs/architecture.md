@@ -25,8 +25,8 @@ flowchart TB
     end
 
     subgraph infra["Infrastructure subsystems"]
-        Q["core/queue (+ backends)"]
-        C["core/cache (+ backends)"]
+        Q["core/queue (+ drivers)"]
+        C["core/cache (+ drivers)"]
         N["core/nats"]
         L["core/logger"]
         HC["core/healthcheck"]
@@ -108,7 +108,7 @@ See [Engine & web application](engine.md) for the full walkthrough.
 
 ## The queue pipeline
 
-`core/queue` decouples *what* to process (typed items) from *where* they are stored (backends) and
+`core/queue` decouples *what* to process (typed items) from *where* they are stored (drivers) and
 *how* they are consumed (autoscaling worker pools). One `Store` manages one executor per numeric queue
 ID — typically a transport account ID.
 
@@ -123,14 +123,14 @@ flowchart TB
 
     subgraph executor1["Executor internals"]
         direction TB
-        Q1["Queue[T]"] --> B1["Backend[T]"]
+        Q1["Queue[T]"] --> B1["Driver[T]"]
         WG["workerGroup<br/>(WorkerPolicy)"] --> W1["Worker"]
         WG --> W2["Worker"]
         W1 --> P["Processor(ctx, id, Delivery[T])"]
         W2 --> P
     end
 
-    subgraph backends["Backend implementations"]
+    subgraph drivers["Driver implementations"]
         MEM["queue/memory<br/>process-local"]
         BS2["queue/beanstalk<br/>beanstalkd tube"]
         NB["queue/nats<br/>JetStream stream + consumer"]
@@ -162,21 +162,21 @@ stateDiagram-v2
 ```
 
 A delivery that reaches the processor is *settled* exactly once. If the processor returns or panics
-without settling, the delivery stays pending in the backend and an optional
+without settling, the delivery stays pending in the driver and an optional
 `WithUnsettledProcessor` hook observes it.
 
 See [Queues](queues.md).
 
 ## The cache layers
 
-`core/cache` is a typed facade (`Cache[K, V]`) over interchangeable backends. In-memory backends are
-process-local and TTL-bounded; NATS backends store entries in JetStream key-value buckets shared by
+`core/cache` is a typed facade (`Cache[K, V]`) over interchangeable drivers. In-memory drivers are
+process-local and TTL-bounded; NATS drivers store entries in JetStream key-value buckets shared by
 every replica of the transport.
 
 ```mermaid
 flowchart LR
     CODE["transport code"] --> FACADE["cache.Cache[K, V]<br/>get/set/has/delete/clear/len"]
-    FACADE --> BEH["cache.Backend[K, V]"]
+    FACADE --> BEH["cache.Driver[K, V]"]
     BEH --> MEMB["cache/memory<br/>otter cache<br/>capacity + write TTL"]
     BEH --> NATB["cache/nats<br/>JetStream KV bucket<br/>server-side TTL"]
     NATB --> KEYENC["KeyEncoder[K]<br/>(string or JSON+base64 keys)"]
@@ -187,8 +187,8 @@ See [Cache](cache.md).
 
 ## The NATS stack
 
-`core/nats.Client` owns a single NATS connection with JetStream enabled. Queue backends (streams,
-durable consumers, message schedules) and cache backends (KV buckets) are built on the same client,
+`core/nats.Client` owns a single NATS connection with JetStream enabled. Queue drivers (streams,
+durable consumers, message schedules) and cache drivers (KV buckets) are built on the same client,
 so a transport needs exactly one connection regardless of how many subsystems it uses.
 
 ```mermaid
@@ -199,8 +199,8 @@ flowchart TB
         CONN --> JS
     end
 
-    QN["queue/nats.Backend"] --> JS
-    CN["cache/nats.Backend"] --> JS
+    QN["queue/nats.Driver"] --> JS
+    CN["cache/nats.Driver"] --> JS
 
     subgraph server["NATS server"]
         STR["Stream<br/>(AllowMsgSchedules)"]

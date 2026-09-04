@@ -84,9 +84,9 @@ func (timeoutError) Error() string {
 	return "timeout"
 }
 
-func TestBackend(t *testing.T) {
-	backend := New(newFakeManager(), queue.JSONCodec[string]{}, Options{PollTimeout: time.Millisecond})
-	q := queue.New(1, backend)
+func TestDriver(t *testing.T) {
+	driver := New(newFakeManager(), queue.JSONCodec[string]{}, Options{PollTimeout: time.Millisecond})
+	q := queue.New(1, driver)
 	require.NoError(t, q.Enqueue(t.Context(), "job", queue.WithID("transport-message-id")))
 	delivery, err := q.Dequeue(t.Context())
 	require.NoError(t, err)

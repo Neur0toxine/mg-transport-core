@@ -1,4 +1,4 @@
-// Package beanstalk provides a queue.Backend implementation backed by beanstalkd tubes.
+// Package beanstalk provides a queue.Driver implementation backed by beanstalkd tubes.
 //
 // # Architecture
 //
@@ -7,7 +7,7 @@
 // consumer connection bound to a tube set for Reserve and settlement operations. Both connections
 // transparently reconnect with a configurable delay on network errors, and Close shuts both down.
 //
-// The Backend adapts the Manager to the queue.Backend contract. Items are wrapped into an envelope
+// The Driver adapts the Manager to the queue.Driver contract. Items are wrapped into an envelope
 // carrying the caller-provided ID and the enqueue timestamp, serialized with a queue.Codec. Delivery
 // leases map to the beanstalkd time-to-run: Touch renews the lease, Requeue maps to Release with a
 // delay, Ack and Reject both Delete the job, and a lease expiry re-releases the job server-side.
@@ -18,11 +18,11 @@
 //	if err != nil {
 //	    return err
 //	}
-//	backend := beanstalk.New[Job](manager, queue.JSONCodec[Job]{}, beanstalk.Options{
+//	driver := beanstalk.New[Job](manager, queue.JSONCodec[Job]{}, beanstalk.Options{
 //	    Priority: 1,
 //	    TTR:      time.Minute,
 //	})
 //
-// The backend is durable across restarts: jobs live in beanstalkd until deleted, and delayed items use
+// The driver is durable across restarts: jobs live in beanstalkd until deleted, and delayed items use
 // native beanstalkd delays.
 package beanstalk

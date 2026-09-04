@@ -13,8 +13,8 @@ import (
 )
 
 func TestQueueDeliveryLifecycle(t *testing.T) {
-	backend := memory.New[int](memory.Options{AckWait: 50 * time.Millisecond})
-	q := queue.New(7, backend)
+	driver := memory.New[int](memory.Options{AckWait: 50 * time.Millisecond})
+	q := queue.New(7, driver)
 	require.NoError(t, q.Enqueue(t.Context(), 1, queue.WithID("caller-id")))
 	require.NoError(t, q.Enqueue(t.Context(), 2, queue.WithDelay(30*time.Millisecond)))
 
@@ -63,7 +63,7 @@ func TestMemoryRedeliversExpiredDelivery(t *testing.T) {
 func TestWorkerUsesUnsettledProcessor(t *testing.T) {
 	var called atomic.Int64
 	store, err := queue.NewStore(
-		func(context.Context, int) (queue.Backend[int], error) {
+		func(context.Context, int) (queue.Driver[int], error) {
 			return memory.New[int](memory.Options{}), nil
 		},
 		func(context.Context, int, queue.Delivery[int]) {},
@@ -82,7 +82,7 @@ func TestWorkerUsesUnsettledProcessor(t *testing.T) {
 
 func TestStoreConstructsAndDrainsQueues(t *testing.T) {
 	store, err := queue.NewStore(
-		func(context.Context, int) (queue.Backend[int], error) {
+		func(context.Context, int) (queue.Driver[int], error) {
 			return memory.New[int](memory.Options{}), nil
 		},
 		func(ctx context.Context, _ int, delivery queue.Delivery[int]) {

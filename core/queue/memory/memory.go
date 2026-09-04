@@ -11,7 +11,7 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
-// Options configures a memory backend.
+// Options configures a memory driver.
 type Options struct {
 	// AckWait is the delivery lease duration: an unsettled delivery is re-queued after it expires.
 	// Non-positive values default to 30 seconds.
@@ -53,8 +53,8 @@ func (h *delayedHeap[T]) Pop() any {
 	return last
 }
 
-// Memory is a process-local Backend with ready, deferred, and in-flight item sets guarded by a mutex.
-// It implements queue.Backend and is safe for concurrent use within one process; state does not
+// Memory is a process-local Driver with ready, deferred, and in-flight item sets guarded by a mutex.
+// It implements queue.Driver and is safe for concurrent use within one process; state does not
 // survive restarts.
 type Memory[T any] struct {
 	mu        sync.Mutex
@@ -69,7 +69,7 @@ type Memory[T any] struct {
 	sequence  atomic.Uint64
 }
 
-// New creates a memory backend. Items are held only in the current process, and delayed items are
+// New creates a memory driver. Items are held only in the current process, and delayed items are
 // scheduled internally with a heap ordered by their NotBefore time.
 func New[T any](options Options) *Memory[T] {
 	if options.AckWait <= 0 {
@@ -138,7 +138,7 @@ func (b *Memory[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 			entry := b.ready[0]
 			b.ready = b.ready[1:]
 			entry.attempt++
-			delivery := &memoryDelivery[T]{backend: b, entry: entry, deliveredAt: now}
+			delivery := &memoryDelivery[T]{driver: b, entry: entry, deliveredAt: now}
 			initialized := make(chan struct{})
 			delivery.timer = time.AfterFunc(b.ackWait, func() {
 				<-initialized
@@ -204,7 +204,7 @@ func (b *Memory[T]) Close(context.Context) error {
 }
 
 type memoryDelivery[T any] struct {
-	backend     *Memory[T]
+	driver      *Memory[T]
 	entry       *item[T]
 	deliveredAt time.Time
 	timer       *time.Timer
@@ -226,11 +226,11 @@ func (d *memoryDelivery[T]) terminal(fn func()) error {
 		return queue.ErrDeliverySettled
 	}
 	d.timer.Stop()
-	d.backend.mu.Lock()
-	delete(d.backend.inFlight, d.entry.internalID)
+	d.driver.mu.Lock()
+	delete(d.driver.inFlight, d.entry.internalID)
 	fn()
-	d.backend.mu.Unlock()
-	d.backend.signal()
+	d.driver.mu.Unlock()
+	d.driver.signal()
 	return nil
 }
 
@@ -248,9 +248,9 @@ func (d *memoryDelivery[T]) Requeue(ctx context.Context, delay time.Duration) er
 	return d.terminal(func() {
 		d.entry.notBefore = time.Now().Add(delay)
 		if delay > 0 {
-			heap.Push(&d.backend.delayed, d.entry)
+			heap.Push(&d.driver.delayed, d.entry)
 		} else {
-			d.backend.ready = append(d.backend.ready, d.entry)
+			d.driver.ready = append(d.driver.ready, d.entry)
 		}
 	})
 }
@@ -261,11 +261,11 @@ func (d *memoryDelivery[T]) Touch(ctx context.Context) error {
 	if d.Settled() {
 		return queue.ErrDeliverySettled
 	}
-	d.timer.Reset(d.backend.ackWait)
+	d.timer.Reset(d.driver.ackWait)
 	return nil
 }
 func (d *memoryDelivery[T]) expire() {
-	_ = d.terminal(func() { d.backend.ready = append(d.backend.ready, d.entry) })
+	_ = d.terminal(func() { d.driver.ready = append(d.driver.ready, d.entry) })
 }
 
-var _ queue.Backend[int] = (*Memory[int])(nil)
+var _ queue.Driver[int] = (*Memory[int])(nil)

@@ -12,7 +12,7 @@ import (
 	corenats "github.com/retailcrm/mg-transport-core/v2/core/nats"
 )
 
-// ProvisionMode selects how the backend obtains its JetStream KV bucket.
+// ProvisionMode selects how the driver obtains its JetStream KV bucket.
 type ProvisionMode uint8
 
 const (
@@ -23,7 +23,7 @@ const (
 	Ensure
 )
 
-// Config configures a JetStream KV cache backend.
+// Config configures a JetStream KV cache driver.
 type Config struct {
 	// Bucket is the JetStream key-value configuration; Bucket.Bucket (the name) and the TTL are used
 	// by both provision modes.
@@ -33,9 +33,9 @@ type Config struct {
 	Provision ProvisionMode
 }
 
-// Backend is a cache.Backend over one JetStream KV bucket shared through a core/nats.Client. It is
+// Driver is a cache.Driver over one JetStream KV bucket shared through a core/nats.Client. It is
 // safe for concurrent use.
-type Backend[K comparable, V any] struct {
+type Driver[K comparable, V any] struct {
 	keyValue  jetstream.KeyValue
 	keyCodec  cache.KeyEncoder[K]
 	codec     cache.Codec[V]
@@ -43,7 +43,7 @@ type Backend[K comparable, V any] struct {
 	closeOnce sync.Once
 }
 
-// New builds a JetStream KV cache backend from a connected core NATS client, a key encoder, a value
+// New builds a JetStream KV cache driver from a connected core NATS client, a key encoder, a value
 // codec, and a configuration. Depending on Config.Provision it creates or updates the bucket (Ensure)
 // or binds to an existing bucket whose TTL must match the configured one (BindExisting).
 func New[K comparable, V any](
@@ -52,7 +52,7 @@ func New[K comparable, V any](
 	keyCodec cache.KeyEncoder[K],
 	codec cache.Codec[V],
 	config Config,
-) (*Backend[K, V], error) {
+) (*Driver[K, V], error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -88,7 +88,7 @@ func New[K comparable, V any](
 		}
 	}
 
-	return &Backend[K, V]{keyValue: keyValue, keyCodec: keyCodec, codec: codec}, nil
+	return &Driver[K, V]{keyValue: keyValue, keyCodec: keyCodec, codec: codec}, nil
 }
 
 func validateBucket(ctx context.Context, keyValue jetstream.KeyValue, expected jetstream.KeyValueConfig) error {
@@ -125,7 +125,7 @@ func normalizeBucketConfig(config jetstream.KeyValueConfig) jetstream.KeyValueCo
 	return config
 }
 
-func (b *Backend[K, V]) check(ctx context.Context) error {
+func (b *Driver[K, V]) check(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -135,7 +135,7 @@ func (b *Backend[K, V]) check(ctx context.Context) error {
 	return nil
 }
 
-func (b *Backend[K, V]) encodeKey(key K) (string, error) {
+func (b *Driver[K, V]) encodeKey(key K) (string, error) {
 	encoded, err := b.keyCodec.EncodeKey(key)
 	if err != nil {
 		return "", fmt.Errorf("encode NATS cache key: %w", err)
@@ -145,13 +145,13 @@ func (b *Backend[K, V]) encodeKey(key K) (string, error) {
 
 // Get fetches and decodes the value for the key. A missing key yields a zero value, false, and a nil
 // error.
-func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
+func (b *Driver[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	entry, found, err := b.GetEntry(ctx, key)
 	return entry.Value, found, err
 }
 
 // GetEntry fetches and decodes a value together with its JetStream revision metadata.
-func (b *Backend[K, V]) GetEntry(ctx context.Context, key K) (cache.Entry[V], bool, error) {
+func (b *Driver[K, V]) GetEntry(ctx context.Context, key K) (cache.Entry[V], bool, error) {
 	if err := b.check(ctx); err != nil {
 		return cache.Entry[V]{}, false, err
 	}
@@ -174,7 +174,7 @@ func (b *Backend[K, V]) GetEntry(ctx context.Context, key K) (cache.Entry[V], bo
 }
 
 // Set encodes the value and stores it under the key, replacing any previous entry.
-func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
+func (b *Driver[K, V]) Set(ctx context.Context, key K, value V) error {
 	if err := b.check(ctx); err != nil {
 		return err
 	}
@@ -193,7 +193,7 @@ func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 }
 
 // Create stores a value only when the key does not currently exist.
-func (b *Backend[K, V]) Create(ctx context.Context, key K, value V) (uint64, error) {
+func (b *Driver[K, V]) Create(ctx context.Context, key K, value V) (uint64, error) {
 	encodedKey, encodedValue, err := b.encode(ctx, key, value)
 	if err != nil {
 		return 0, err
@@ -209,7 +209,7 @@ func (b *Backend[K, V]) Create(ctx context.Context, key K, value V) (uint64, err
 }
 
 // Update replaces a value only when revision is still current.
-func (b *Backend[K, V]) Update(ctx context.Context, key K, value V, revision uint64) (uint64, error) {
+func (b *Driver[K, V]) Update(ctx context.Context, key K, value V, revision uint64) (uint64, error) {
 	encodedKey, encodedValue, err := b.encode(ctx, key, value)
 	if err != nil {
 		return 0, err
@@ -224,7 +224,7 @@ func (b *Backend[K, V]) Update(ctx context.Context, key K, value V, revision uin
 	return nextRevision, nil
 }
 
-func (b *Backend[K, V]) encode(ctx context.Context, key K, value V) (string, []byte, error) {
+func (b *Driver[K, V]) encode(ctx context.Context, key K, value V) (string, []byte, error) {
 	if err := b.check(ctx); err != nil {
 		return "", nil, err
 	}
@@ -240,7 +240,7 @@ func (b *Backend[K, V]) encode(ctx context.Context, key K, value V) (string, []b
 }
 
 // Has reports whether the key is present without decoding the value.
-func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
+func (b *Driver[K, V]) Has(ctx context.Context, key K) (bool, error) {
 	if err := b.check(ctx); err != nil {
 		return false, err
 	}
@@ -259,7 +259,7 @@ func (b *Backend[K, V]) Has(ctx context.Context, key K) (bool, error) {
 }
 
 // Delete purges the key so no per-key history accumulates. Deleting a missing key is not an error.
-func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
+func (b *Driver[K, V]) Delete(ctx context.Context, key K) error {
 	if err := b.check(ctx); err != nil {
 		return err
 	}
@@ -279,7 +279,7 @@ func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 }
 
 // DeleteRevision places a delete marker only when revision is still current.
-func (b *Backend[K, V]) DeleteRevision(ctx context.Context, key K, revision uint64) error {
+func (b *Driver[K, V]) DeleteRevision(ctx context.Context, key K, revision uint64) error {
 	if err := b.check(ctx); err != nil {
 		return err
 	}
@@ -298,7 +298,7 @@ func (b *Backend[K, V]) DeleteRevision(ctx context.Context, key K, revision uint
 }
 
 // Keys returns all current keys decoded to their typed form.
-func (b *Backend[K, V]) Keys(ctx context.Context) ([]K, error) {
+func (b *Driver[K, V]) Keys(ctx context.Context) ([]K, error) {
 	if err := b.check(ctx); err != nil {
 		return nil, err
 	}
@@ -325,7 +325,7 @@ func (b *Backend[K, V]) Keys(ctx context.Context) ([]K, error) {
 }
 
 // Clear purges every key in the bucket. Individual purge failures are joined into the result.
-func (b *Backend[K, V]) Clear(ctx context.Context) error {
+func (b *Driver[K, V]) Clear(ctx context.Context) error {
 	if err := b.check(ctx); err != nil {
 		return err
 	}
@@ -346,7 +346,7 @@ func (b *Backend[K, V]) Clear(ctx context.Context) error {
 }
 
 // Len counts the keys currently present in the bucket.
-func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
+func (b *Driver[K, V]) Len(ctx context.Context) (int, error) {
 	if err := b.check(ctx); err != nil {
 		return 0, err
 	}
@@ -360,9 +360,9 @@ func (b *Backend[K, V]) Len(ctx context.Context) (int, error) {
 	return len(keys), nil
 }
 
-// Close marks the backend closed; subsequent operations return cache.ErrClosed. It does not close the
+// Close marks the driver closed; subsequent operations return cache.ErrClosed. It does not close the
 // shared NATS client and does not delete the bucket. Close is idempotent.
-func (b *Backend[K, V]) Close(ctx context.Context) error {
+func (b *Driver[K, V]) Close(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -372,5 +372,5 @@ func (b *Backend[K, V]) Close(ctx context.Context) error {
 	return nil
 }
 
-var _ cache.Backend[int, int] = (*Backend[int, int])(nil)
-var _ cache.VersionedBackend[int, int] = (*Backend[int, int])(nil)
+var _ cache.Driver[int, int] = (*Driver[int, int])(nil)
+var _ cache.VersionedDriver[int, int] = (*Driver[int, int])(nil)

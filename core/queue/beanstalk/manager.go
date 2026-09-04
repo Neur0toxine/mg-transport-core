@@ -22,7 +22,7 @@ type TubeStats struct {
 	Reserved int64
 }
 
-// ManagerInterface is the subset of beanstalkd operations required by a Backend. It is implemented by
+// ManagerInterface is the subset of beanstalkd operations required by a Driver. It is implemented by
 // Manager and can be satisfied by test doubles.
 type ManagerInterface interface {
 	Put([]byte, uint32, time.Duration, time.Duration) (uint64, error)

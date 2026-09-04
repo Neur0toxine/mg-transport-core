@@ -9,7 +9,7 @@ import (
 // Processor consumes a single delivery. It receives the queue ID alongside the delivery so one
 // processor can serve every executor of a Store. The processor must settle the delivery with Ack,
 // Requeue, or Reject; if it does not (and no UnsettledProcessor is registered), the delivery stays
-// pending in the backend.
+// pending in the driver.
 type Processor[T any] func(context.Context, int, Delivery[T])
 
 // PanicHandler observes the recovered value when a Processor or UnsettledProcessor panics. The panic

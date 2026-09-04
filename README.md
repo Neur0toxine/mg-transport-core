@@ -149,15 +149,15 @@ $ go get -u github.com/retailcrm/mg-transport-core/cmd/transport-core-tool
 ```
 Currently, it only can generate new migrations for your transport.
 
-### Queue backends
+### Queue drivers
 
-`core/queue` provides a typed queue, workers, and a queue store independent of storage. Backends live in
-`core/queue/memory`, `core/queue/beanstalk`, and `core/queue/nats`. Persistent backends accept a `queue.Codec[T]`;
+`core/queue` provides a typed queue, workers, and a queue store independent of storage. Drivers live in
+`core/queue/memory`, `core/queue/beanstalk`, and `core/queue/nats`. Persistent drivers accept a `queue.Codec[T]`;
 `queue.JSONCodec[T]` uses Go's JSON v2 implementation.
 
 ```go
 jobs, err := queue.NewStore(
-    func(context.Context, int) (queue.Backend[Job], error) {
+    func(context.Context, int) (queue.Driver[Job], error) {
         return memory.New[Job](memory.Options{AckWait: 30 * time.Second}), nil
     },
     func(ctx context.Context, accountID int, delivery queue.Delivery[Job]) {
@@ -181,15 +181,15 @@ if err := jobs.Enqueue(ctx, accountID, job, queue.WithID(job.ID), queue.WithDela
 return jobs.Stop(ctx)
 ```
 
-Deliveries must be explicitly acknowledged, requeued, or rejected. `Touch` renews the backend acknowledgment lease.
+Deliveries must be explicitly acknowledged, requeued, or rejected. `Touch` renews the driver acknowledgment lease.
 An unsettled worker delivery remains pending unless `queue.WithUnsettledProcessor` is configured. A store owns one
-executor per numeric queue ID; each executor owns its backend, worker group, scaling controller, and lifecycle. Scaling
-reacts to local enqueues and periodically checks backend statistics, so persisted or remotely published work is also
-discovered. `Store.Reconcile` can keep the executor set aligned with active transport accounts. The NATS backend
+executor per numeric queue ID; each executor owns its driver, worker group, scaling controller, and lifecycle. Scaling
+reacts to local enqueues and periodically checks driver statistics, so persisted or remotely published work is also
+discovered. `Store.Reconcile` can keep the executor set aligned with active transport accounts. The NATS driver
 uses a durable JetStream pull consumer and requires message schedules. Its `Ensure` mode can create or update the
 stream and consumer; `BindExisting` only validates pre-provisioned resources.
 
-Use `queue.FuncCodec` when persisted values need runtime-only dependencies restored after decoding. The backend
+Use `queue.FuncCodec` when persisted values need runtime-only dependencies restored after decoding. The driver
 constructor receives the queue ID, so a transport can bind the decoder and NATS subject to the same account:
 
 ```go
@@ -205,21 +205,21 @@ codec := queue.FuncCodec[*Task]{
 }
 ```
 
-### Cache backends
+### Cache drivers
 
-`core/cache` provides a typed cache adapter with interchangeable in-memory and NATS JetStream KV backends. Cache
-entries use a fixed backend-wide TTL. Persistent values and non-string keys are encoded explicitly, allowing a
+`core/cache` provides a typed cache adapter with interchangeable in-memory and NATS JetStream KV drivers. Cache
+entries use a fixed driver-wide TTL. Persistent values and non-string keys are encoded explicitly, allowing a
 transport-specific cache to switch storage without changing its domain-facing API.
 
 ```go
-backend, err := memory.New[int, Account](memory.Options{
+driver, err := memory.New[int, Account](memory.Options{
     Capacity: 1_000,
     TTL:      time.Hour,
 })
 if err != nil {
     return err
 }
-accounts := cache.New(backend)
+accounts := cache.New(driver)
 
 if err := accounts.Set(ctx, account.ID, account); err != nil {
     return err
@@ -227,6 +227,6 @@ if err := accounts.Set(ctx, account.ID, account); err != nil {
 account, found, err := accounts.Get(ctx, accountID)
 ```
 
-The NATS backend accepts the shared `core/nats.Client`, a typed `cache.KeyEncoder`, a value `cache.Codec`, and a
+The NATS driver accepts the shared `core/nats.Client`, a typed `cache.KeyEncoder`, a value `cache.Codec`, and a
 JetStream KV configuration. `Ensure` creates or updates the bucket, while `BindExisting` only binds to a bucket with
 the configured TTL. Closing a NATS cache does not close the shared client or delete the bucket.

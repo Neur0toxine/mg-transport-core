@@ -12,28 +12,28 @@ var (
 	ErrIntakeClosed = errors.New("queue intake is closed")
 	// ErrDeliverySettled is returned when a delivery is acknowledged, requeued, or rejected a second time.
 	ErrDeliverySettled = errors.New("delivery is already settled")
-	// ErrSchedulingUnsupported is returned when delayed enqueue is requested from a backend whose
+	// ErrSchedulingUnsupported is returned when delayed enqueue is requested from a driver whose
 	// scheduling support is disabled.
 	ErrSchedulingUnsupported = errors.New("queue scheduling is not supported")
-	// ErrDeadLetterUnsupported is returned when DeadLetter is used with a delivery whose backend has
+	// ErrDeadLetterUnsupported is returned when DeadLetter is used with a delivery whose driver has
 	// no dead-letter support configured.
 	ErrDeadLetterUnsupported = errors.New("queue dead-lettering is not supported")
 )
 
-// EnqueueOptions controls how an item is enqueued by a Backend.
+// EnqueueOptions controls how an item is enqueued by a Driver.
 type EnqueueOptions struct {
-	// ID is the caller-provided delivery identity. Backends that support deduplication use it as the
-	// message ID; when empty a backend-generated ID is used.
+	// ID is the caller-provided delivery identity. Drivers that support deduplication use it as the
+	// message ID; when empty a driver-generated ID is used.
 	ID string
 	// NotBefore defers the item until the given time. A zero value makes the item immediately ready.
-	// Backends without native scheduling emulate it with delayed delivery.
+	// Drivers without native scheduling emulate it with delayed delivery.
 	NotBefore time.Time
 }
 
 // EnqueueOption mutates EnqueueOptions during Enqueue.
 type EnqueueOption func(*EnqueueOptions)
 
-// WithID assigns a stable delivery ID, enabling deduplication in supporting backends.
+// WithID assigns a stable delivery ID, enabling deduplication in supporting drivers.
 func WithID(id string) EnqueueOption {
 	return func(options *EnqueueOptions) { options.ID = id }
 }
@@ -48,8 +48,8 @@ func WithNotBefore(notBefore time.Time) EnqueueOption {
 	return func(options *EnqueueOptions) { options.NotBefore = notBefore }
 }
 
-// ApplyEnqueueOptions folds the given options into an EnqueueOptions value. Backends call it internally;
-// it is exported mostly for tests and custom Backend implementations.
+// ApplyEnqueueOptions folds the given options into an EnqueueOptions value. Drivers call it internally;
+// it is exported mostly for tests and custom Driver implementations.
 func ApplyEnqueueOptions(options ...EnqueueOption) EnqueueOptions {
 	var result EnqueueOptions
 	for _, option := range options {
@@ -69,7 +69,7 @@ type Metadata struct {
 
 // Delivery is a single dequeued item handed to a Processor. Exactly one of Ack, Requeue, or Reject must
 // eventually be called; every method returns ErrDeliverySettled after the first successful settlement.
-// Touch extends the backend acknowledgment lease and does not settle the delivery.
+// Touch extends the driver acknowledgment lease and does not settle the delivery.
 type Delivery[T any] interface {
 	// Value returns the decoded item.
 	Value() T
@@ -87,13 +87,13 @@ type Delivery[T any] interface {
 	Settled() bool
 }
 
-// DeadLetterDelivery is optionally implemented by deliveries whose backend can preserve rejected
+// DeadLetterDelivery is optionally implemented by deliveries whose driver can preserve rejected
 // messages in a dead-letter destination.
 type DeadLetterDelivery interface {
 	DeadLetter(context.Context, error) error
 }
 
-// DeadLetter rejects a delivery after preserving it in the backend's dead-letter destination. It
+// DeadLetter rejects a delivery after preserving it in the driver's dead-letter destination. It
 // returns ErrDeadLetterUnsupported when the delivery has no configured dead-letter implementation.
 func DeadLetter[T any](ctx context.Context, delivery Delivery[T], cause error) error {
 	deadLetter, ok := delivery.(DeadLetterDelivery)
@@ -118,25 +118,25 @@ func (s Stats) Queued() int64 {
 	return s.Ready + s.Deferred
 }
 
-// Backend stores items and hands out deliveries. The interface is intentionally small so that radically
+// Driver stores items and hands out deliveries. The interface is intentionally small so that radically
 // different storages (in-memory, beanstalkd, NATS JetStream) can implement it; implementations live in
 // the memory, beanstalk, and nats subpackages. Dequeue blocks until a delivery is available, the context
-// is canceled, or the backend is closed.
-type Backend[T any] interface {
+// is canceled, or the driver is closed.
+type Driver[T any] interface {
 	Enqueue(context.Context, T, EnqueueOptions) error
 	Dequeue(context.Context) (Delivery[T], error)
 	Stats(context.Context) (Stats, error)
 	Close(context.Context) error
 }
 
-// Queue pairs a Backend with lifecycle management for a single queue ID: it tracks the last enqueue
+// Queue pairs a Driver with lifecycle management for a single queue ID: it tracks the last enqueue
 // time, can close the intake for graceful shutdown, and cancels in-flight dequeues once closed.
 // Queues are normally not created directly but owned by an Executor, which in turn is managed by a Store.
 type Queue[T any] struct {
-	id      int
-	backend Backend[T]
-	ctx     context.Context
-	cancel  context.CancelCauseFunc
+	id     int
+	driver Driver[T]
+	ctx    context.Context
+	cancel context.CancelCauseFunc
 
 	mu           sync.RWMutex
 	intakeClosed bool
@@ -145,10 +145,10 @@ type Queue[T any] struct {
 	closeErr     error
 }
 
-// New creates a Queue with the given numeric ID and backend.
-func New[T any](id int, backend Backend[T]) *Queue[T] {
+// New creates a Queue with the given numeric ID and driver.
+func New[T any](id int, driver Driver[T]) *Queue[T] {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	return &Queue[T]{id: id, backend: backend, ctx: ctx, cancel: cancel}
+	return &Queue[T]{id: id, driver: driver, ctx: ctx, cancel: cancel}
 }
 
 // ID returns the queue identifier passed to New.
@@ -170,8 +170,8 @@ func (q *Queue[T]) LastEnqueueTime() time.Time {
 	return q.lastEnqueued
 }
 
-// Enqueue adds an item to the backend. It returns ErrIntakeClosed after CloseIntake, and the queue
-// cancellation cause after Close. Options are applied before reaching the backend.
+// Enqueue adds an item to the driver. It returns ErrIntakeClosed after CloseIntake, and the queue
+// cancellation cause after Close. Options are applied before reaching the driver.
 func (q *Queue[T]) Enqueue(ctx context.Context, item T, options ...EnqueueOption) error {
 	q.mu.RLock()
 	if q.intakeClosed {
@@ -182,7 +182,7 @@ func (q *Queue[T]) Enqueue(ctx context.Context, item T, options ...EnqueueOption
 		q.mu.RUnlock()
 		return context.Cause(q.ctx)
 	}
-	if err := q.backend.Enqueue(ctx, item, ApplyEnqueueOptions(options...)); err != nil {
+	if err := q.driver.Enqueue(ctx, item, ApplyEnqueueOptions(options...)); err != nil {
 		q.mu.RUnlock()
 		return err
 	}
@@ -193,19 +193,19 @@ func (q *Queue[T]) Enqueue(ctx context.Context, item T, options ...EnqueueOption
 	return nil
 }
 
-// Dequeue waits for the next backend delivery. The call is aborted when either the passed context or the
+// Dequeue waits for the next driver delivery. The call is aborted when either the passed context or the
 // queue itself is closed, so workers stop promptly during shutdown.
 func (q *Queue[T]) Dequeue(ctx context.Context) (Delivery[T], error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	stop := context.AfterFunc(q.ctx, func() { cancel(context.Cause(q.ctx)) })
 	defer stop()
 	defer cancel(nil)
-	return q.backend.Dequeue(ctx)
+	return q.driver.Dequeue(ctx)
 }
 
-// Stats returns the backend workload counters.
+// Stats returns the driver workload counters.
 func (q *Queue[T]) Stats(ctx context.Context) (Stats, error) {
-	return q.backend.Stats(ctx)
+	return q.driver.Stats(ctx)
 }
 
 // CloseIntake rejects further Enqueue calls while allowing workers to drain already enqueued items.
@@ -216,12 +216,12 @@ func (q *Queue[T]) CloseIntake() {
 	q.mu.Unlock()
 }
 
-// Close cancels the queue context (aborting in-flight dequeues) and closes the backend. It is
+// Close cancels the queue context (aborting in-flight dequeues) and closes the driver. It is
 // idempotent: subsequent calls return the first error without repeating the work.
 func (q *Queue[T]) Close(ctx context.Context) error {
 	q.closeOnce.Do(func() {
 		q.cancel(context.Canceled)
-		q.closeErr = q.backend.Close(ctx)
+		q.closeErr = q.driver.Close(ctx)
 	})
 	return q.closeErr
 }

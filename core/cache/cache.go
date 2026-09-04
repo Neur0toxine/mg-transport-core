@@ -12,15 +12,15 @@ var (
 	// ErrConflict is returned when a create-only write finds an existing key or a conditional
 	// update/delete observes a different revision.
 	ErrConflict = errors.New("cache entry revision conflict")
-	// ErrKeyDecodingUnsupported is returned by Keys when a backend was configured with an encoder
+	// ErrKeyDecodingUnsupported is returned by Keys when a driver was configured with an encoder
 	// that cannot decode persisted keys back to their typed form.
 	ErrKeyDecodingUnsupported = errors.New("cache key decoding is not supported")
 )
 
-// Backend is the storage contract behind Cache. Implementations live in the memory and nats
+// Driver is the storage contract behind Cache. Implementations live in the memory and nats
 // subpackages. Get reports a miss with a false second result instead of an error; Len counts the
 // entries currently stored.
-type Backend[K comparable, V any] interface {
+type Driver[K comparable, V any] interface {
 	Get(context.Context, K) (V, bool, error)
 	Set(context.Context, K, V) error
 	Has(context.Context, K) (bool, error)
@@ -30,7 +30,7 @@ type Backend[K comparable, V any] interface {
 	Close(context.Context) error
 }
 
-// Entry is a versioned cache value. Revision is backend-defined and can be passed to Update or
+// Entry is a versioned cache value. Revision is driver-defined and can be passed to Update or
 // DeleteRevision for optimistic concurrency control. CreatedAt is the time of this revision.
 type Entry[V any] struct {
 	Value     V
@@ -38,10 +38,10 @@ type Entry[V any] struct {
 	CreatedAt time.Time
 }
 
-// VersionedBackend extends Backend with atomic operations suitable for shared state. Implementations
+// VersionedDriver extends Driver with atomic operations suitable for shared state. Implementations
 // map conflicting creates and stale revisions to ErrConflict.
-type VersionedBackend[K comparable, V any] interface {
-	Backend[K, V]
+type VersionedDriver[K comparable, V any] interface {
+	Driver[K, V]
 	GetEntry(context.Context, K) (Entry[V], bool, error)
 	Create(context.Context, K, V) (uint64, error)
 	Update(context.Context, K, V, uint64) (uint64, error)
@@ -49,85 +49,85 @@ type VersionedBackend[K comparable, V any] interface {
 	Keys(context.Context) ([]K, error)
 }
 
-// Cache is a typed facade over a Backend. Construct it with New and share it freely: the cache adds no
-// state of its own and is safe for concurrent use as long as the backend is.
+// Cache is a typed facade over a Driver. Construct it with New and share it freely: the cache adds no
+// state of its own and is safe for concurrent use as long as the driver is.
 type Cache[K comparable, V any] struct {
-	backend Backend[K, V]
+	driver Driver[K, V]
 }
 
-// New wraps a backend into the user-facing cache facade.
-func New[K comparable, V any](backend Backend[K, V]) *Cache[K, V] {
-	return &Cache[K, V]{backend: backend}
+// New wraps a driver into the user-facing cache facade.
+func New[K comparable, V any](driver Driver[K, V]) *Cache[K, V] {
+	return &Cache[K, V]{driver: driver}
 }
 
-// VersionedCache is a typed facade over a VersionedBackend. It embeds the ordinary cache facade and
-// adds optimistic-concurrency operations without expanding the basic Backend contract.
+// VersionedCache is a typed facade over a VersionedDriver. It embeds the ordinary cache facade and
+// adds optimistic-concurrency operations without expanding the basic Driver contract.
 type VersionedCache[K comparable, V any] struct {
 	*Cache[K, V]
-	backend VersionedBackend[K, V]
+	driver VersionedDriver[K, V]
 }
 
-// NewVersioned wraps a versioned backend into a user-facing facade.
-func NewVersioned[K comparable, V any](backend VersionedBackend[K, V]) *VersionedCache[K, V] {
-	return &VersionedCache[K, V]{Cache: New[K, V](backend), backend: backend}
+// NewVersioned wraps a versioned driver into a user-facing facade.
+func NewVersioned[K comparable, V any](driver VersionedDriver[K, V]) *VersionedCache[K, V] {
+	return &VersionedCache[K, V]{Cache: New[K, V](driver), driver: driver}
 }
 
 // GetEntry returns a value together with its revision metadata.
 func (c *VersionedCache[K, V]) GetEntry(ctx context.Context, key K) (Entry[V], bool, error) {
-	return c.backend.GetEntry(ctx, key)
+	return c.driver.GetEntry(ctx, key)
 }
 
 // Create stores a value only when the key does not currently exist.
 func (c *VersionedCache[K, V]) Create(ctx context.Context, key K, value V) (uint64, error) {
-	return c.backend.Create(ctx, key, value)
+	return c.driver.Create(ctx, key, value)
 }
 
 // Update replaces a value only when revision is still current.
 func (c *VersionedCache[K, V]) Update(ctx context.Context, key K, value V, revision uint64) (uint64, error) {
-	return c.backend.Update(ctx, key, value, revision)
+	return c.driver.Update(ctx, key, value, revision)
 }
 
 // DeleteRevision removes a value only when revision is still current.
 func (c *VersionedCache[K, V]) DeleteRevision(ctx context.Context, key K, revision uint64) error {
-	return c.backend.DeleteRevision(ctx, key, revision)
+	return c.driver.DeleteRevision(ctx, key, revision)
 }
 
 // Keys returns all currently present typed keys.
 func (c *VersionedCache[K, V]) Keys(ctx context.Context) ([]K, error) {
-	return c.backend.Keys(ctx)
+	return c.driver.Keys(ctx)
 }
 
 // Get returns the cached value for the key. A missing key yields a zero value, false, and a nil error.
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
-	return c.backend.Get(ctx, key)
+	return c.driver.Get(ctx, key)
 }
 
 // Set stores the value under the key, replacing any previous entry.
 func (c *Cache[K, V]) Set(ctx context.Context, key K, value V) error {
-	return c.backend.Set(ctx, key, value)
+	return c.driver.Set(ctx, key, value)
 }
 
 // Has reports whether the key is present without decoding the value.
 func (c *Cache[K, V]) Has(ctx context.Context, key K) (bool, error) {
-	return c.backend.Has(ctx, key)
+	return c.driver.Has(ctx, key)
 }
 
 // Delete removes the key. Deleting a missing key is not an error.
 func (c *Cache[K, V]) Delete(ctx context.Context, key K) error {
-	return c.backend.Delete(ctx, key)
+	return c.driver.Delete(ctx, key)
 }
 
-// Clear removes every entry from the backend.
+// Clear removes every entry from the driver.
 func (c *Cache[K, V]) Clear(ctx context.Context) error {
-	return c.backend.Clear(ctx)
+	return c.driver.Clear(ctx)
 }
 
 // Len returns the number of entries currently stored.
 func (c *Cache[K, V]) Len(ctx context.Context) (int, error) {
-	return c.backend.Len(ctx)
+	return c.driver.Len(ctx)
 }
 
-// Close releases backend resources. Subsequent operations return ErrClosed.
+// Close releases driver resources. Subsequent operations return ErrClosed.
 func (c *Cache[K, V]) Close(ctx context.Context) error {
-	return c.backend.Close(ctx)
+	return c.driver.Close(ctx)
 }

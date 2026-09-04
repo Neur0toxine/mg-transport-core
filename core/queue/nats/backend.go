@@ -19,7 +19,7 @@ import (
 	"github.com/retailcrm/mg-transport-core/v2/core/queue"
 )
 
-// ProvisionMode selects how the backend obtains its JetStream stream and consumer.
+// ProvisionMode selects how the driver obtains its JetStream stream and consumer.
 type ProvisionMode uint8
 
 const (
@@ -42,13 +42,13 @@ const (
 )
 
 // DeadLetterConfig configures a separate stream used to preserve poison messages. Subject is the
-// destination for this backend; Stream must cover it. Provisioning follows the parent Config mode.
+// destination for this driver; Stream must cover it. Provisioning follows the parent Config mode.
 type DeadLetterConfig struct {
 	Subject string
 	Stream  jetstream.StreamConfig
 }
 
-// Config configures a JetStream queue backend.
+// Config configures a JetStream queue driver.
 type Config struct {
 	// Subject is the subject ready items are published to and the consumer filters on. Required.
 	Subject string
@@ -60,7 +60,7 @@ type Config struct {
 	// only the Name for lookup and validates the rest.
 	Stream jetstream.StreamConfig
 	// Consumer is the durable pull consumer configuration. Either Name or Durable must be set; the
-	// other defaults to the provided one. The backend enforces explicit acknowledgments and the
+	// other defaults to the provided one. The driver enforces explicit acknowledgments and the
 	// queue-subject filter.
 	Consumer jetstream.ConsumerConfig
 	// Provision selects between creating the resources and binding to existing ones.
@@ -77,9 +77,9 @@ type Config struct {
 	DeadLetter *DeadLetterConfig
 }
 
-// Backend is a queue.Backend implementation over one JetStream stream and one durable pull consumer.
+// Driver is a queue.Driver implementation over one JetStream stream and one durable pull consumer.
 // It is safe for concurrent use.
-type Backend[T any] struct {
+type Driver[T any] struct {
 	js       jetstream.JetStream
 	stream   jetstream.Stream
 	consumer jetstream.Consumer
@@ -94,7 +94,7 @@ type envelope struct {
 	Payload    []byte    `json:"payload"`
 }
 
-// New builds a JetStream queue backend from a connected core NATS client, an item codec, and a
+// New builds a JetStream queue driver from a connected core NATS client, an item codec, and a
 // configuration. Depending on Config.Provision it creates or updates the stream and consumer (Ensure)
 // or binds to and validates existing ones (BindExisting).
 func New[T any](
@@ -102,7 +102,7 @@ func New[T any](
 	client *corenats.Client,
 	codec queue.Codec[T],
 	config Config,
-) (*Backend[T], error) {
+) (*Driver[T], error) {
 	if client == nil || client.JetStream == nil {
 		return nil, errors.New("NATS JetStream client is required")
 	}
@@ -134,7 +134,7 @@ func New[T any](
 		return nil, errors.New("NATS dead-letter subject and stream name are required")
 	}
 
-	b := &Backend[T]{js: client.JetStream, codec: codec, config: config}
+	b := &Driver[T]{js: client.JetStream, codec: codec, config: config}
 	var err error
 	if config.Provision == Ensure {
 		err = b.ensure(ctx)
@@ -147,7 +147,7 @@ func New[T any](
 	return b, nil
 }
 
-func (b *Backend[T]) ensure(ctx context.Context) error {
+func (b *Driver[T]) ensure(ctx context.Context) error {
 	config := b.config.Stream
 	config.AllowMsgSchedules = !b.config.DisableScheduling
 	if len(config.Subjects) == 0 {
@@ -174,7 +174,7 @@ func (b *Backend[T]) ensure(ctx context.Context) error {
 	return b.ensureDeadLetter(ctx)
 }
 
-func (b *Backend[T]) bind(ctx context.Context) error {
+func (b *Driver[T]) bind(ctx context.Context) error {
 	stream, err := b.js.Stream(ctx, b.config.Stream.Name)
 	if err != nil {
 		return fmt.Errorf("bind NATS stream %q: %w", b.config.Stream.Name, err)
@@ -205,14 +205,14 @@ func (b *Backend[T]) bind(ctx context.Context) error {
 	return b.bindDeadLetter(ctx)
 }
 
-func (b *Backend[T]) scheduleSubject() string {
+func (b *Driver[T]) scheduleSubject() string {
 	if b.config.DisableScheduling {
 		return ""
 	}
 	return b.config.ScheduleSubject
 }
 
-func (b *Backend[T]) ensureDeadLetter(ctx context.Context) error {
+func (b *Driver[T]) ensureDeadLetter(ctx context.Context) error {
 	if b.config.DeadLetter == nil {
 		return nil
 	}
@@ -230,7 +230,7 @@ func (b *Backend[T]) ensureDeadLetter(ctx context.Context) error {
 	return nil
 }
 
-func (b *Backend[T]) bindDeadLetter(ctx context.Context) error {
+func (b *Driver[T]) bindDeadLetter(ctx context.Context) error {
 	if b.config.DeadLetter == nil {
 		return nil
 	}
@@ -251,7 +251,7 @@ func (b *Backend[T]) bindDeadLetter(ctx context.Context) error {
 // Enqueue publishes the encoded item to the queue subject, or to the schedule subject with a
 // schedule-at time when the item is deferred. The enqueue ID is used as the JetStream message ID for
 // deduplication.
-func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
+func (b *Driver[T]) Enqueue(ctx context.Context, value T, options queue.EnqueueOptions) error {
 	if b.closed.Load() {
 		return context.Canceled
 	}
@@ -298,7 +298,7 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 // Dequeue fetches the next message from the durable consumer. Messages whose envelope or payload
 // cannot be decoded are terminated; the error is returned to the caller, and the next Dequeue attempt
 // fetches the following message.
-func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
+func (b *Driver[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -327,7 +327,7 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 			return nil, b.rejectMalformed(ctx, message, fmt.Errorf("decode NATS delivery: %w", err))
 		}
 		return &delivery[T]{
-			backend: b,
+			driver:  b,
 			message: message,
 			value:   value,
 			metadata: queue.Metadata{
@@ -338,7 +338,7 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 	}
 }
 
-func (b *Backend[T]) decodeMessage(message jetstream.Msg, metadata *jetstream.MsgMetadata) (envelope, error) {
+func (b *Driver[T]) decodeMessage(message jetstream.Msg, metadata *jetstream.MsgMetadata) (envelope, error) {
 	if b.config.PayloadMode == PayloadRaw {
 		id := message.Headers().Get(jetstream.MsgIDHeader)
 		if id == "" {
@@ -353,7 +353,7 @@ func (b *Backend[T]) decodeMessage(message jetstream.Msg, metadata *jetstream.Ms
 	return body, nil
 }
 
-func (b *Backend[T]) rejectMalformed(ctx context.Context, message jetstream.Msg, cause error) error {
+func (b *Driver[T]) rejectMalformed(ctx context.Context, message jetstream.Msg, cause error) error {
 	if b.config.DeadLetter == nil {
 		_ = message.Term()
 		return cause
@@ -368,7 +368,7 @@ func (b *Backend[T]) rejectMalformed(ctx context.Context, message jetstream.Msg,
 	return cause
 }
 
-func (b *Backend[T]) publishDeadLetter(ctx context.Context, message jetstream.Msg, cause error) error {
+func (b *Driver[T]) publishDeadLetter(ctx context.Context, message jetstream.Msg, cause error) error {
 	if b.config.DeadLetter == nil {
 		return queue.ErrDeadLetterUnsupported
 	}
@@ -388,7 +388,7 @@ func (b *Backend[T]) publishDeadLetter(ctx context.Context, message jetstream.Ms
 // Stats maps consumer and stream counters to the queue counters: pending messages are Ready,
 // scheduled messages under the schedule subject are Deferred, and unacknowledged deliveries are
 // InFlight.
-func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
+func (b *Driver[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	info, err := b.consumer.Info(ctx)
 	if err != nil {
 		return queue.Stats{}, err
@@ -415,13 +415,13 @@ func queueCount(value uint64) int64 {
 
 // Close stops dequeue-polling. The stream, consumer, and the shared client connection stay intact so
 // other users of the stream are unaffected.
-func (b *Backend[T]) Close(context.Context) error {
+func (b *Driver[T]) Close(context.Context) error {
 	b.closed.Store(true)
 	return nil
 }
 
 type delivery[T any] struct {
-	backend  *Backend[T]
+	driver   *Driver[T]
 	message  jetstream.Msg
 	value    T
 	metadata queue.Metadata
@@ -485,14 +485,14 @@ func (d *delivery[T]) DeadLetter(ctx context.Context, cause error) error {
 		cause = errors.New("delivery rejected")
 	}
 	return d.terminal(func() error {
-		if err := d.backend.publishDeadLetter(ctx, d.message, cause); err != nil {
+		if err := d.driver.publishDeadLetter(ctx, d.message, cause); err != nil {
 			return err
 		}
 		return d.message.Term()
 	})
 }
 
-var _ queue.Backend[int] = (*Backend[int])(nil)
+var _ queue.Driver[int] = (*Driver[int])(nil)
 
 func validateSubjects(patterns []string, subject, scheduleSubject string) error {
 	if !coveredBy(patterns, subject) {

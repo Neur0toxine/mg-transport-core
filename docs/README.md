@@ -20,9 +20,9 @@ module github.com/retailcrm/mg-transport-core/v2
 |---|---|
 | [Architecture overview](architecture.md) | How the library is wired: engine composition, queue pipeline, cache layers, NATS stack. |
 | [Engine & web application](engine.md) | Bootstrapping an application: config, router, localization, templates, sessions, CSRF, Sentry, jobs, shutdown. |
-| [Queues](queues.md) | The `core/queue` subsystem: stores, executors, backends, delivery lifecycle, worker scaling, graceful shutdown. |
-| [Cache](cache.md) | The `core/cache` subsystem: typed facade, in-memory and NATS JetStream KV backends, codecs. |
-| [NATS integration](nats.md) | The shared `core/nats` client and how queue and cache backends reuse one connection. |
+| [Queues](queues.md) | The `core/queue` subsystem: stores, executors, drivers, delivery lifecycle, worker scaling, graceful shutdown. |
+| [Cache](cache.md) | The `core/cache` subsystem: typed facade, in-memory and NATS JetStream KV drivers, codecs. |
+| [NATS integration](nats.md) | The shared `core/nats` client and how queue and cache drivers reuse one connection. |
 | [Package reference](packages.md) | One-page reference for every package, including logger, middleware, healthcheck, db, util, and the CLI tool. |
 
 ## Quick start

@@ -13,10 +13,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBackendLifecycle(t *testing.T) {
-	backend, err := memory.New[string, int](memory.Options{Capacity: 10})
+func TestDriverLifecycle(t *testing.T) {
+	driver, err := memory.New[string, int](memory.Options{Capacity: 10})
 	require.NoError(t, err)
-	c := cache.New[string, int](backend)
+	c := cache.New[string, int](driver)
 
 	value, found, err := c.Get(t.Context(), "missing")
 	require.NoError(t, err)
@@ -50,38 +50,38 @@ func TestBackendLifecycle(t *testing.T) {
 	require.ErrorIs(t, c.Set(t.Context(), "closed", 1), cache.ErrClosed)
 }
 
-func TestBackendHonorsContext(t *testing.T) {
-	backend, err := memory.New[string, int](memory.Options{Capacity: 1})
+func TestDriverHonorsContext(t *testing.T) {
+	driver, err := memory.New[string, int](memory.Options{Capacity: 1})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = backend.Close(t.Context()) })
+	t.Cleanup(func() { _ = driver.Close(t.Context()) })
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	require.ErrorIs(t, backend.Set(ctx, "key", 1), context.Canceled)
+	require.ErrorIs(t, driver.Set(ctx, "key", 1), context.Canceled)
 }
 
-func TestBackendExpiresAfterLastSet(t *testing.T) {
-	backend, err := memory.New[string, int](memory.Options{Capacity: 10, TTL: 100 * time.Millisecond})
+func TestDriverExpiresAfterLastSet(t *testing.T) {
+	driver, err := memory.New[string, int](memory.Options{Capacity: 10, TTL: 100 * time.Millisecond})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = backend.Close(t.Context()) })
+	t.Cleanup(func() { _ = driver.Close(t.Context()) })
 
-	require.NoError(t, backend.Set(t.Context(), "key", 1))
+	require.NoError(t, driver.Set(t.Context(), "key", 1))
 	time.Sleep(70 * time.Millisecond)
-	require.NoError(t, backend.Set(t.Context(), "key", 2))
+	require.NoError(t, driver.Set(t.Context(), "key", 2))
 	time.Sleep(70 * time.Millisecond)
 
-	value, found, err := backend.Get(t.Context(), "key")
+	value, found, err := driver.Get(t.Context(), "key")
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, 2, value)
 
 	require.Eventually(t, func() bool {
-		_, found, getErr := backend.Get(t.Context(), "key")
+		_, found, getErr := driver.Get(t.Context(), "key")
 		return getErr == nil && !found
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestBackendRequiresPositiveCapacity(t *testing.T) {
+func TestDriverRequiresPositiveCapacity(t *testing.T) {
 	_, err := memory.New[string, int](memory.Options{})
 	require.Error(t, err)
 
@@ -89,40 +89,40 @@ func TestBackendRequiresPositiveCapacity(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestBackendEnforcesCapacity(t *testing.T) {
-	backend, err := memory.New[int, int](memory.Options{Capacity: 2})
+func TestDriverEnforcesCapacity(t *testing.T) {
+	driver, err := memory.New[int, int](memory.Options{Capacity: 2})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = backend.Close(t.Context()) })
+	t.Cleanup(func() { _ = driver.Close(t.Context()) })
 
 	for value := range 100 {
-		require.NoError(t, backend.Set(t.Context(), value, value))
+		require.NoError(t, driver.Set(t.Context(), value, value))
 	}
 	require.Eventually(t, func() bool {
-		length, lenErr := backend.Len(t.Context())
+		length, lenErr := driver.Len(t.Context())
 		return lenErr == nil && length <= 2
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestBackendSupportsConcurrentAccess(t *testing.T) {
-	backend, err := memory.New[string, int](memory.Options{Capacity: 1_000})
+func TestDriverSupportsConcurrentAccess(t *testing.T) {
+	driver, err := memory.New[string, int](memory.Options{Capacity: 1_000})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = backend.Close(t.Context()) })
+	t.Cleanup(func() { _ = driver.Close(t.Context()) })
 
 	var workers sync.WaitGroup
 	for worker := range 20 {
 		workers.Go(func() {
 			for value := range 100 {
 				key := strconv.Itoa(worker*100 + value)
-				if err := backend.Set(t.Context(), key, value); err != nil {
+				if err := driver.Set(t.Context(), key, value); err != nil {
 					t.Errorf("set %q: %v", key, err)
 					return
 				}
-				_, _, getErr := backend.Get(t.Context(), key)
+				_, _, getErr := driver.Get(t.Context(), key)
 				if getErr != nil {
 					t.Errorf("get %q: %v", key, getErr)
 					return
 				}
-				if err := backend.Delete(t.Context(), key); err != nil {
+				if err := driver.Delete(t.Context(), key); err != nil {
 					t.Errorf("delete %q: %v", key, err)
 					return
 				}
