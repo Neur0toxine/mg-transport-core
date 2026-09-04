@@ -12,6 +12,12 @@ var (
 	ErrIntakeClosed = errors.New("queue intake is closed")
 	// ErrDeliverySettled is returned when a delivery is acknowledged, requeued, or rejected a second time.
 	ErrDeliverySettled = errors.New("delivery is already settled")
+	// ErrSchedulingUnsupported is returned when delayed enqueue is requested from a backend whose
+	// scheduling support is disabled.
+	ErrSchedulingUnsupported = errors.New("queue scheduling is not supported")
+	// ErrDeadLetterUnsupported is returned when DeadLetter is used with a delivery whose backend has
+	// no dead-letter support configured.
+	ErrDeadLetterUnsupported = errors.New("queue dead-lettering is not supported")
 )
 
 // EnqueueOptions controls how an item is enqueued by a Backend.
@@ -79,6 +85,22 @@ type Delivery[T any] interface {
 	Touch(context.Context) error
 	// Settled reports whether the delivery was already settled.
 	Settled() bool
+}
+
+// DeadLetterDelivery is optionally implemented by deliveries whose backend can preserve rejected
+// messages in a dead-letter destination.
+type DeadLetterDelivery interface {
+	DeadLetter(context.Context, error) error
+}
+
+// DeadLetter rejects a delivery after preserving it in the backend's dead-letter destination. It
+// returns ErrDeadLetterUnsupported when the delivery has no configured dead-letter implementation.
+func DeadLetter[T any](ctx context.Context, delivery Delivery[T], cause error) error {
+	deadLetter, ok := delivery.(DeadLetterDelivery)
+	if !ok {
+		return ErrDeadLetterUnsupported
+	}
+	return deadLetter.DeadLetter(ctx, cause)
 }
 
 // Stats is a snapshot of the queue workload counters.

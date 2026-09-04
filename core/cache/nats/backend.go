@@ -96,15 +96,33 @@ func validateBucket(ctx context.Context, keyValue jetstream.KeyValue, expected j
 	if err != nil {
 		return fmt.Errorf("inspect NATS cache bucket %q: %w", expected.Bucket, err)
 	}
-	if status.TTL() != expected.TTL {
+	actual := status.Config()
+	expected = normalizeBucketConfig(expected)
+	actual = normalizeBucketConfig(actual)
+	if actual.TTL != expected.TTL || actual.History != expected.History ||
+		actual.Replicas != expected.Replicas || actual.Storage != expected.Storage {
 		return fmt.Errorf(
-			"NATS cache bucket %q TTL is %s, expected %s",
+			"NATS cache bucket %q configuration mismatch: got TTL=%s history=%d replicas=%d storage=%s, "+
+				"expected TTL=%s history=%d replicas=%d storage=%s",
 			expected.Bucket,
-			status.TTL(),
-			expected.TTL,
+			actual.TTL, actual.History, actual.Replicas, actual.Storage,
+			expected.TTL, expected.History, expected.Replicas, expected.Storage,
 		)
 	}
 	return nil
+}
+
+func normalizeBucketConfig(config jetstream.KeyValueConfig) jetstream.KeyValueConfig {
+	if config.History == 0 {
+		config.History = 1
+	}
+	if config.Replicas == 0 {
+		config.Replicas = 1
+	}
+	if config.Storage == 0 {
+		config.Storage = jetstream.FileStorage
+	}
+	return config
 }
 
 func (b *Backend[K, V]) check(ctx context.Context) error {
@@ -128,26 +146,31 @@ func (b *Backend[K, V]) encodeKey(key K) (string, error) {
 // Get fetches and decodes the value for the key. A missing key yields a zero value, false, and a nil
 // error.
 func (b *Backend[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
-	var zero V
+	entry, found, err := b.GetEntry(ctx, key)
+	return entry.Value, found, err
+}
+
+// GetEntry fetches and decodes a value together with its JetStream revision metadata.
+func (b *Backend[K, V]) GetEntry(ctx context.Context, key K) (cache.Entry[V], bool, error) {
 	if err := b.check(ctx); err != nil {
-		return zero, false, err
+		return cache.Entry[V]{}, false, err
 	}
 	encodedKey, err := b.encodeKey(key)
 	if err != nil {
-		return zero, false, err
+		return cache.Entry[V]{}, false, err
 	}
 	entry, err := b.keyValue.Get(ctx, encodedKey)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		return zero, false, nil
+		return cache.Entry[V]{}, false, nil
 	}
 	if err != nil {
-		return zero, false, fmt.Errorf("get NATS cache key %q: %w", encodedKey, err)
+		return cache.Entry[V]{}, false, fmt.Errorf("get NATS cache key %q: %w", encodedKey, err)
 	}
 	value, err := b.codec.Decode(entry.Value())
 	if err != nil {
-		return zero, false, fmt.Errorf("decode NATS cache value for key %q: %w", encodedKey, err)
+		return cache.Entry[V]{}, false, fmt.Errorf("decode NATS cache value for key %q: %w", encodedKey, err)
 	}
-	return value, true, nil
+	return cache.Entry[V]{Value: value, Revision: entry.Revision(), CreatedAt: entry.Created()}, true, nil
 }
 
 // Set encodes the value and stores it under the key, replacing any previous entry.
@@ -167,6 +190,53 @@ func (b *Backend[K, V]) Set(ctx context.Context, key K, value V) error {
 		return fmt.Errorf("set NATS cache key %q: %w", encodedKey, err)
 	}
 	return nil
+}
+
+// Create stores a value only when the key does not currently exist.
+func (b *Backend[K, V]) Create(ctx context.Context, key K, value V) (uint64, error) {
+	encodedKey, encodedValue, err := b.encode(ctx, key, value)
+	if err != nil {
+		return 0, err
+	}
+	revision, err := b.keyValue.Create(ctx, encodedKey, encodedValue)
+	if errors.Is(err, jetstream.ErrKeyExists) {
+		return 0, fmt.Errorf("create NATS cache key %q: %w", encodedKey, cache.ErrConflict)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("create NATS cache key %q: %w", encodedKey, err)
+	}
+	return revision, nil
+}
+
+// Update replaces a value only when revision is still current.
+func (b *Backend[K, V]) Update(ctx context.Context, key K, value V, revision uint64) (uint64, error) {
+	encodedKey, encodedValue, err := b.encode(ctx, key, value)
+	if err != nil {
+		return 0, err
+	}
+	nextRevision, err := b.keyValue.Update(ctx, encodedKey, encodedValue, revision)
+	if errors.Is(err, jetstream.ErrKeyRevisionMismatch) {
+		return 0, fmt.Errorf("update NATS cache key %q: %w", encodedKey, cache.ErrConflict)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("update NATS cache key %q: %w", encodedKey, err)
+	}
+	return nextRevision, nil
+}
+
+func (b *Backend[K, V]) encode(ctx context.Context, key K, value V) (string, []byte, error) {
+	if err := b.check(ctx); err != nil {
+		return "", nil, err
+	}
+	encodedKey, err := b.encodeKey(key)
+	if err != nil {
+		return "", nil, err
+	}
+	encodedValue, err := b.codec.Encode(value)
+	if err != nil {
+		return "", nil, fmt.Errorf("encode NATS cache value for key %q: %w", encodedKey, err)
+	}
+	return encodedKey, encodedValue, nil
 }
 
 // Has reports whether the key is present without decoding the value.
@@ -206,6 +276,52 @@ func (b *Backend[K, V]) Delete(ctx context.Context, key K) error {
 		return fmt.Errorf("delete NATS cache key %q: %w", encodedKey, err)
 	}
 	return nil
+}
+
+// DeleteRevision places a delete marker only when revision is still current.
+func (b *Backend[K, V]) DeleteRevision(ctx context.Context, key K, revision uint64) error {
+	if err := b.check(ctx); err != nil {
+		return err
+	}
+	encodedKey, err := b.encodeKey(key)
+	if err != nil {
+		return err
+	}
+	err = b.keyValue.Delete(ctx, encodedKey, jetstream.LastRevision(revision))
+	if errors.Is(err, jetstream.ErrKeyRevisionMismatch) || errors.Is(err, jetstream.ErrKeyNotFound) {
+		return fmt.Errorf("delete NATS cache key %q: %w", encodedKey, cache.ErrConflict)
+	}
+	if err != nil {
+		return fmt.Errorf("delete NATS cache key %q: %w", encodedKey, err)
+	}
+	return nil
+}
+
+// Keys returns all current keys decoded to their typed form.
+func (b *Backend[K, V]) Keys(ctx context.Context) ([]K, error) {
+	if err := b.check(ctx); err != nil {
+		return nil, err
+	}
+	decoder, ok := b.keyCodec.(cache.KeyDecoder[K])
+	if !ok {
+		return nil, cache.ErrKeyDecodingUnsupported
+	}
+	encodedKeys, err := b.keyValue.Keys(ctx)
+	if errors.Is(err, jetstream.ErrNoKeysFound) {
+		return []K{}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list NATS cache keys: %w", err)
+	}
+	keys := make([]K, 0, len(encodedKeys))
+	for _, encodedKey := range encodedKeys {
+		key, decodeErr := decoder.DecodeKey(encodedKey)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode NATS cache key %q: %w", encodedKey, decodeErr)
+		}
+		keys = append(keys, key)
+	}
+	return keys, nil
 }
 
 // Clear purges every key in the bucket. Individual purge failures are joined into the result.
@@ -257,3 +373,4 @@ func (b *Backend[K, V]) Close(ctx context.Context) error {
 }
 
 var _ cache.Backend[int, int] = (*Backend[int, int])(nil)
+var _ cache.VersionedBackend[int, int] = (*Backend[int, int])(nil)

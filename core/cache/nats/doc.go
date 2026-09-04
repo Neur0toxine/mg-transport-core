@@ -1,5 +1,5 @@
-// Package nats provides a distributed cache.Backend implementation backed by NATS JetStream key-value
-// buckets.
+// Package nats provides distributed cache.Backend and cache.VersionedBackend implementations backed
+// by NATS JetStream key-value buckets.
 //
 // # Architecture
 //
@@ -10,12 +10,17 @@
 //
 // Entry expiry is a bucket-wide property: the TTL configured in jetstream.KeyValueConfig is applied by
 // the server to every entry, and clients cannot override it per key. Because of that, BindExisting
-// validates that the existing bucket's TTL matches the configured one and refuses to bind otherwise.
+// validates that the existing bucket's TTL, history, replica count, and storage match the configured
+// values and refuses to bind otherwise.
 // Use Provision mode Ensure to create or update the bucket (and its TTL) from the application.
 //
 // The bucket content is shared by every process using it, which makes the backend a building block for
 // cross-replica caches. Backends do not watch for updates: reads hit the server, so changes made by
 // another process are visible on the next operation.
+//
+// The versioned facade exposes JetStream revisions for optimistic concurrency. Create is
+// create-if-absent, Update and DeleteRevision require the current revision, and Keys decodes bucket
+// keys through a cache.KeyDecoder. Revision conflicts match cache.ErrConflict.
 //
 // # Usage
 //

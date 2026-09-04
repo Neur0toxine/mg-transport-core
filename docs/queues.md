@@ -224,6 +224,22 @@ backendFor := func(ctx context.Context, accountID int) (queue.Backend[Job], erro
 The enqueue ID is used as the JetStream message ID, giving publisher-side deduplication. `Stats` maps
 consumer pending (Ready), scheduled messages (Deferred), and unacknowledged deliveries (InFlight).
 
+For compatibility with streams populated by direct NATS publishers, use `PayloadMode: nats.PayloadRaw`.
+The codec bytes then form the entire message body, while ID and enqueue time come from NATS metadata.
+Set `DisableScheduling: true` for streams without message schedules; `NakWithDelay` retries remain
+available, but enqueue with `WithDelay` or `WithNotBefore` returns `queue.ErrSchedulingUnsupported`.
+
+Configure `DeadLetter` with a subject and stream to preserve poison messages. Decode failures are
+copied automatically with `X-Error` and `X-Original-Subject` headers. A processor can preserve a
+terminal processing failure explicitly:
+
+```go
+if err := handle(ctx, delivery.Value()); err != nil {
+    _ = queue.DeadLetter(ctx, delivery, err)
+    return
+}
+```
+
 ### Codecs
 
 Persistent backends serialize items with a `queue.Codec[T]`:

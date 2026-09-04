@@ -100,9 +100,14 @@ Both NATS backends select their provisioning behavior with a `ProvisionMode`:
 | `BindExisting` | Bind to pre-provisioned resources and *validate* their configuration; create nothing. |
 
 `BindExisting` is intended for environments where infrastructure is managed externally (Terraform,
-operators) and applications run with reduced permissions. Queue binding requires the stream to allow
-message schedules and the consumer to use explicit acknowledgments on the configured subject; cache
-binding requires the bucket TTL to match the configuration.
+operators) and applications run with reduced permissions. Queue binding requires message schedules
+unless explicitly disabled and a consumer with explicit acknowledgments on the configured subject;
+cache binding checks TTL, history, replicas, and storage.
+
+Legacy queues can opt into raw codec payloads and disable enqueue scheduling. NATS queues can also
+provision or bind a separate DLQ stream. The NATS cache additionally implements the versioned cache
+contract (create-if-absent, CAS update/delete, revision metadata, and typed key listing), which can be
+used for delivery state, leases, and shared counters.
 
 ## Where to go next
 

@@ -3,6 +3,7 @@ package nats_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -200,4 +201,72 @@ func TestBackendHonorsContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	require.ErrorIs(t, backend.Set(ctx, 1, "value"), context.Canceled)
+}
+
+func TestVersionedBackendLifecycle(t *testing.T) {
+	client := startNATS(t)
+	backend := newBackend(t, client, "CACHE_VERSIONED", cachenats.Ensure, 0)
+	versioned := cache.NewVersioned[int, string](backend)
+
+	entry, found, err := versioned.GetEntry(t.Context(), 1)
+	require.NoError(t, err)
+	assert.False(t, found)
+	assert.Empty(t, entry)
+
+	revision, err := versioned.Create(t.Context(), 1, "first")
+	require.NoError(t, err)
+	assert.NotZero(t, revision)
+	_, err = versioned.Create(t.Context(), 1, "duplicate")
+	require.ErrorIs(t, err, cache.ErrConflict)
+
+	entry, found, err = versioned.GetEntry(t.Context(), 1)
+	require.NoError(t, err)
+	assert.True(t, found)
+	assert.Equal(t, "first", entry.Value)
+	assert.Equal(t, revision, entry.Revision)
+	assert.False(t, entry.CreatedAt.IsZero())
+
+	nextRevision, err := versioned.Update(t.Context(), 1, "second", revision)
+	require.NoError(t, err)
+	assert.Greater(t, nextRevision, revision)
+	_, err = versioned.Update(t.Context(), 1, "stale", revision)
+	require.ErrorIs(t, err, cache.ErrConflict)
+	require.ErrorIs(t, versioned.DeleteRevision(t.Context(), 1, revision), cache.ErrConflict)
+	require.NoError(t, versioned.DeleteRevision(t.Context(), 1, nextRevision))
+
+	_, found, err = versioned.GetEntry(t.Context(), 1)
+	require.NoError(t, err)
+	assert.False(t, found)
+	_, err = versioned.Create(t.Context(), 1, "recreated")
+	require.NoError(t, err)
+}
+
+func TestVersionedBackendKeys(t *testing.T) {
+	client := startNATS(t)
+	backend := newBackend(t, client, "CACHE_KEYS", cachenats.Ensure, 0)
+	versioned := cache.NewVersioned[int, string](backend)
+
+	keys, err := versioned.Keys(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, keys)
+	_, err = versioned.Create(t.Context(), 2, "two")
+	require.NoError(t, err)
+	_, err = versioned.Create(t.Context(), 1, "one")
+	require.NoError(t, err)
+	keys, err = versioned.Keys(t.Context())
+	require.NoError(t, err)
+	slices.Sort(keys)
+	assert.Equal(t, []int{1, 2}, keys)
+}
+
+func TestVersionedBackendRequiresKeyDecoderForKeys(t *testing.T) {
+	client := startNATS(t)
+	config := cachenats.Config{
+		Bucket:    jetstream.KeyValueConfig{Bucket: "CACHE_KEYS_ENCODER", Storage: jetstream.MemoryStorage},
+		Provision: cachenats.Ensure,
+	}
+	backend, err := cachenats.New(t.Context(), client, failingKeyEncoder{}, cache.JSONCodec[string]{}, config)
+	require.NoError(t, err)
+	_, err = backend.Keys(t.Context())
+	require.ErrorIs(t, err, cache.ErrKeyDecodingUnsupported)
 }

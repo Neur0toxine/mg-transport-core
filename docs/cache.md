@@ -8,6 +8,7 @@ storage details (encoding, TTL semantics, sharing) are a backend concern.
 
 ```go
 type Cache[K comparable, V any] // get / set / has / delete / clear / len / close
+type VersionedCache[K comparable, V any] // Cache plus revisions / CAS / typed keys
 ```
 
 ```go
@@ -86,6 +87,23 @@ Properties to be aware of:
 - **Closing is local.** `Close` only marks the backend closed; the shared NATS client and the bucket
   itself are untouched.
 
+For shared mutable state, wrap the same backend with `cache.NewVersioned`. `Create` reserves an absent
+key, `GetEntry` returns its revision, and `Update` / `DeleteRevision` perform optimistic concurrency:
+
+```go
+state := cache.NewVersioned[string, DeliveryState](backend)
+revision, err := state.Create(ctx, deliveryID, initial)
+if errors.Is(err, cache.ErrConflict) {
+    current, found, err := state.GetEntry(ctx, deliveryID)
+    // Resolve the conflict or retry an Update with current.Revision.
+}
+_, err = state.Update(ctx, deliveryID, completed, revision)
+keys, err := state.Keys(ctx)
+```
+
+`BindExisting` validates TTL, history, replicas, and storage. `Keys` requires a key converter that
+also implements `cache.KeyDecoder`; both built-in key encoders do.
+
 ```mermaid
 flowchart LR
     subgraph replica1["Replica A"]
@@ -109,7 +127,8 @@ Bucket keys are strings and stored values are bytes, so the NATS backend takes t
 | `cache.JSONCodec[V]{}` | Values as encoding/json/v2. |
 | `cache.BytesCodec{}` | Pass `[]byte` values through (already-encoded payloads). |
 
-Custom encodings plug in by implementing `cache.KeyEncoder[K]` or `cache.Codec[V]`.
+Custom encodings plug in by implementing `cache.KeyEncoder[K]` or `cache.Codec[V]`. Implement
+`cache.KeyCodec[K]` when typed key listing is required.
 
 ## Choosing a backend
 

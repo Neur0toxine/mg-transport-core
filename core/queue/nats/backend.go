@@ -5,6 +5,8 @@ import (
 	json "encoding/json/v2"
 	"errors"
 	"fmt"
+	"maps"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +30,23 @@ const (
 	Ensure
 )
 
+// PayloadMode selects the bytes stored in JetStream.
+type PayloadMode uint8
+
+const (
+	// PayloadEnvelope stores delivery metadata and the encoded value in an internal JSON envelope.
+	PayloadEnvelope PayloadMode = iota
+	// PayloadRaw stores only the codec output and derives delivery metadata from the NATS message.
+	PayloadRaw
+)
+
+// DeadLetterConfig configures a separate stream used to preserve poison messages. Subject is the
+// destination for this backend; Stream must cover it. Provisioning follows the parent Config mode.
+type DeadLetterConfig struct {
+	Subject string
+	Stream  jetstream.StreamConfig
+}
+
 // Config configures a JetStream queue backend.
 type Config struct {
 	// Subject is the subject ready items are published to and the consumer filters on. Required.
@@ -47,6 +66,14 @@ type Config struct {
 	Provision ProvisionMode
 	// FetchMaxWait bounds a single consumer fetch while dequeue-polling; it defaults to one second.
 	FetchMaxWait time.Duration
+	// PayloadMode defaults to PayloadEnvelope. PayloadRaw is compatible with producers that publish
+	// codec bytes directly to the queue subject.
+	PayloadMode PayloadMode
+	// DisableScheduling permits binding to streams without message schedules. Delayed enqueue then
+	// returns queue.ErrSchedulingUnsupported; delayed negative acknowledgments remain available.
+	DisableScheduling bool
+	// DeadLetter optionally preserves malformed and explicitly dead-lettered messages.
+	DeadLetter *DeadLetterConfig
 }
 
 // Backend is a queue.Backend implementation over one JetStream stream and one durable pull consumer.
@@ -69,7 +96,12 @@ type envelope struct {
 // New builds a JetStream queue backend from a connected core NATS client, an item codec, and a
 // configuration. Depending on Config.Provision it creates or updates the stream and consumer (Ensure)
 // or binds to and validates existing ones (BindExisting).
-func New[T any](ctx context.Context, client *corenats.Client, codec queue.Codec[T], config Config) (*Backend[T], error) {
+func New[T any](
+	ctx context.Context,
+	client *corenats.Client,
+	codec queue.Codec[T],
+	config Config,
+) (*Backend[T], error) {
 	if client == nil || client.JetStream == nil {
 		return nil, errors.New("NATS JetStream client is required")
 	}
@@ -94,6 +126,12 @@ func New[T any](ctx context.Context, client *corenats.Client, codec queue.Codec[
 	if config.FetchMaxWait <= 0 {
 		config.FetchMaxWait = time.Second
 	}
+	if config.PayloadMode != PayloadEnvelope && config.PayloadMode != PayloadRaw {
+		return nil, errors.New("unsupported NATS queue payload mode")
+	}
+	if config.DeadLetter != nil && (config.DeadLetter.Subject == "" || config.DeadLetter.Stream.Name == "") {
+		return nil, errors.New("NATS dead-letter subject and stream name are required")
+	}
 
 	b := &Backend[T]{js: client.JetStream, codec: codec, config: config}
 	var err error
@@ -110,11 +148,14 @@ func New[T any](ctx context.Context, client *corenats.Client, codec queue.Codec[
 
 func (b *Backend[T]) ensure(ctx context.Context) error {
 	config := b.config.Stream
-	config.AllowMsgSchedules = true
+	config.AllowMsgSchedules = !b.config.DisableScheduling
 	if len(config.Subjects) == 0 {
-		config.Subjects = []string{b.config.Subject, b.config.ScheduleSubject + ".>"}
+		config.Subjects = []string{b.config.Subject}
+		if !b.config.DisableScheduling {
+			config.Subjects = append(config.Subjects, b.config.ScheduleSubject+".>")
+		}
 	}
-	if err := validateSubjects(config.Subjects, b.config.Subject, b.config.ScheduleSubject); err != nil {
+	if err := validateSubjects(config.Subjects, b.config.Subject, b.scheduleSubject()); err != nil {
 		return err
 	}
 	stream, err := b.js.CreateOrUpdateStream(ctx, config)
@@ -129,7 +170,7 @@ func (b *Backend[T]) ensure(ctx context.Context) error {
 		return fmt.Errorf("ensure NATS consumer %q: %w", consumerConfig.Name, err)
 	}
 	b.stream, b.consumer = stream, consumer
-	return nil
+	return b.ensureDeadLetter(ctx)
 }
 
 func (b *Backend[T]) bind(ctx context.Context) error {
@@ -141,10 +182,10 @@ func (b *Backend[T]) bind(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("inspect NATS stream %q: %w", b.config.Stream.Name, err)
 	}
-	if !info.Config.AllowMsgSchedules {
+	if !b.config.DisableScheduling && !info.Config.AllowMsgSchedules {
 		return errors.New("NATS stream does not allow message schedules")
 	}
-	if err := validateSubjects(info.Config.Subjects, b.config.Subject, b.config.ScheduleSubject); err != nil {
+	if err := validateSubjects(info.Config.Subjects, b.config.Subject, b.scheduleSubject()); err != nil {
 		return err
 	}
 	consumer, err := stream.Consumer(ctx, b.config.Consumer.Name)
@@ -155,10 +196,54 @@ func (b *Backend[T]) bind(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("inspect NATS consumer %q: %w", b.config.Consumer.Name, err)
 	}
-	if consumerInfo.Config.AckPolicy != jetstream.AckExplicitPolicy || consumerInfo.Config.FilterSubject != b.config.Subject {
+	if consumerInfo.Config.AckPolicy != jetstream.AckExplicitPolicy ||
+		consumerInfo.Config.FilterSubject != b.config.Subject {
 		return errors.New("NATS consumer must use explicit acknowledgments and the configured queue subject")
 	}
 	b.stream, b.consumer = stream, consumer
+	return b.bindDeadLetter(ctx)
+}
+
+func (b *Backend[T]) scheduleSubject() string {
+	if b.config.DisableScheduling {
+		return ""
+	}
+	return b.config.ScheduleSubject
+}
+
+func (b *Backend[T]) ensureDeadLetter(ctx context.Context) error {
+	if b.config.DeadLetter == nil {
+		return nil
+	}
+	config := b.config.DeadLetter.Stream
+	if len(config.Subjects) == 0 {
+		config.Subjects = []string{b.config.DeadLetter.Subject}
+	}
+	if !coveredBy(config.Subjects, b.config.DeadLetter.Subject) {
+		return fmt.Errorf("NATS dead-letter stream does not cover subject %q", b.config.DeadLetter.Subject)
+	}
+	_, err := b.js.CreateOrUpdateStream(ctx, config)
+	if err != nil {
+		return fmt.Errorf("ensure NATS dead-letter stream %q: %w", config.Name, err)
+	}
+	return nil
+}
+
+func (b *Backend[T]) bindDeadLetter(ctx context.Context) error {
+	if b.config.DeadLetter == nil {
+		return nil
+	}
+	stream, err := b.js.Stream(ctx, b.config.DeadLetter.Stream.Name)
+	if err != nil {
+		return fmt.Errorf("bind NATS dead-letter stream %q: %w", b.config.DeadLetter.Stream.Name, err)
+	}
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect NATS dead-letter stream %q: %w", b.config.DeadLetter.Stream.Name, err)
+	}
+	if !coveredBy(info.Config.Subjects, b.config.DeadLetter.Subject) {
+		return fmt.Errorf("NATS dead-letter stream does not cover subject %q", b.config.DeadLetter.Subject)
+	}
 	return nil
 }
 
@@ -178,16 +263,30 @@ func (b *Backend[T]) Enqueue(ctx context.Context, value T, options queue.Enqueue
 	if id == "" {
 		id = uuid.New().String()
 	}
-	body, err := json.Marshal(envelope{ID: id, EnqueuedAt: now, Payload: payload})
-	if err != nil {
-		return fmt.Errorf("encode NATS envelope: %w", err)
+	body := payload
+	if b.config.PayloadMode == PayloadEnvelope {
+		body, err = json.Marshal(envelope{ID: id, EnqueuedAt: now, Payload: payload})
+		if err != nil {
+			return fmt.Errorf("encode NATS envelope: %w", err)
+		}
 	}
-	message := &natsgo.Msg{Subject: b.config.Subject, Data: body, Header: natsgo.Header{jetstream.MsgIDHeader: []string{id}}}
+	message := &natsgo.Msg{
+		Subject: b.config.Subject,
+		Data:    body,
+		Header:  natsgo.Header{jetstream.MsgIDHeader: []string{id}},
+	}
 	publishOptions := []jetstream.PublishOpt{jetstream.WithMsgID(id)}
 	if options.NotBefore.After(now) {
+		if b.config.DisableScheduling {
+			return queue.ErrSchedulingUnsupported
+		}
 		scheduleToken := strings.ReplaceAll(uuid.New().String(), "-", "")
 		message.Subject = b.config.ScheduleSubject + "." + scheduleToken
-		publishOptions = append(publishOptions, jetstream.WithScheduleAt(options.NotBefore), jetstream.WithScheduleTarget(b.config.Subject))
+		publishOptions = append(
+			publishOptions,
+			jetstream.WithScheduleAt(options.NotBefore),
+			jetstream.WithScheduleTarget(b.config.Subject),
+		)
 	}
 	if _, err := b.js.PublishMsg(ctx, message, publishOptions...); err != nil {
 		return fmt.Errorf("publish NATS delivery: %w", err)
@@ -213,23 +312,76 @@ func (b *Backend[T]) Dequeue(ctx context.Context) (queue.Delivery[T], error) {
 		if err != nil {
 			return nil, fmt.Errorf("fetch NATS delivery: %w", err)
 		}
-		var body envelope
-		if err := json.Unmarshal(message.Data(), &body); err != nil {
-			_ = message.Term()
-			return nil, fmt.Errorf("decode NATS envelope: %w", err)
-		}
-		value, err := b.codec.Decode(body.Payload)
-		if err != nil {
-			_ = message.Term()
-			return nil, fmt.Errorf("decode NATS delivery: %w", err)
-		}
 		metadata, err := message.Metadata()
 		if err != nil {
 			_ = message.Nak()
 			return nil, fmt.Errorf("read NATS delivery metadata: %w", err)
 		}
-		return &delivery[T]{message: message, value: value, metadata: queue.Metadata{ID: body.ID, EnqueuedAt: body.EnqueuedAt, DeliveredAt: time.Now(), Attempt: metadata.NumDelivered}}, nil
+		body, err := b.decodeMessage(message, metadata)
+		if err != nil {
+			return nil, b.rejectMalformed(ctx, message, err)
+		}
+		value, err := b.codec.Decode(body.Payload)
+		if err != nil {
+			return nil, b.rejectMalformed(ctx, message, fmt.Errorf("decode NATS delivery: %w", err))
+		}
+		return &delivery[T]{
+			backend: b,
+			message: message,
+			value:   value,
+			metadata: queue.Metadata{
+				ID: body.ID, EnqueuedAt: body.EnqueuedAt,
+				DeliveredAt: time.Now(), Attempt: metadata.NumDelivered,
+			},
+		}, nil
 	}
+}
+
+func (b *Backend[T]) decodeMessage(message jetstream.Msg, metadata *jetstream.MsgMetadata) (envelope, error) {
+	if b.config.PayloadMode == PayloadRaw {
+		id := message.Headers().Get(jetstream.MsgIDHeader)
+		if id == "" {
+			id = strconv.FormatUint(metadata.Sequence.Stream, 10)
+		}
+		return envelope{ID: id, EnqueuedAt: metadata.Timestamp, Payload: message.Data()}, nil
+	}
+	var body envelope
+	if err := json.Unmarshal(message.Data(), &body); err != nil {
+		return envelope{}, fmt.Errorf("decode NATS envelope: %w", err)
+	}
+	return body, nil
+}
+
+func (b *Backend[T]) rejectMalformed(ctx context.Context, message jetstream.Msg, cause error) error {
+	if b.config.DeadLetter == nil {
+		_ = message.Term()
+		return cause
+	}
+	if err := b.publishDeadLetter(ctx, message, cause); err != nil {
+		_ = message.Nak()
+		return errors.Join(cause, err)
+	}
+	if err := message.Term(); err != nil {
+		return errors.Join(cause, fmt.Errorf("terminate malformed NATS delivery: %w", err))
+	}
+	return cause
+}
+
+func (b *Backend[T]) publishDeadLetter(ctx context.Context, message jetstream.Msg, cause error) error {
+	if b.config.DeadLetter == nil {
+		return queue.ErrDeadLetterUnsupported
+	}
+	header := maps.Clone(message.Headers())
+	if header == nil {
+		header = make(natsgo.Header)
+	}
+	header.Set("X-Error", cause.Error())
+	header.Set("X-Original-Subject", message.Subject())
+	deadLetter := &natsgo.Msg{Subject: b.config.DeadLetter.Subject, Header: header, Data: message.Data()}
+	if _, err := b.js.PublishMsg(ctx, deadLetter); err != nil {
+		return fmt.Errorf("publish NATS dead-letter delivery: %w", err)
+	}
+	return nil
 }
 
 // Stats maps consumer and stream counters to the queue counters: pending messages are Ready,
@@ -239,6 +391,9 @@ func (b *Backend[T]) Stats(ctx context.Context) (queue.Stats, error) {
 	info, err := b.consumer.Info(ctx)
 	if err != nil {
 		return queue.Stats{}, err
+	}
+	if b.config.DisableScheduling {
+		return queue.Stats{Ready: int64(info.NumPending), InFlight: int64(info.NumAckPending)}, nil
 	}
 	streamInfo, err := b.stream.Info(ctx, jetstream.WithSubjectFilter(b.config.ScheduleSubject+".>"))
 	if err != nil {
@@ -259,6 +414,7 @@ func (b *Backend[T]) Close(context.Context) error {
 }
 
 type delivery[T any] struct {
+	backend  *Backend[T]
 	message  jetstream.Msg
 	value    T
 	metadata queue.Metadata
@@ -316,13 +472,26 @@ func (d *delivery[T]) Touch(ctx context.Context) error {
 	return d.message.InProgress()
 }
 
+// DeadLetter preserves the original NATS message with the supplied cause and then terminates it.
+func (d *delivery[T]) DeadLetter(ctx context.Context, cause error) error {
+	if cause == nil {
+		cause = errors.New("delivery rejected")
+	}
+	return d.terminal(func() error {
+		if err := d.backend.publishDeadLetter(ctx, d.message, cause); err != nil {
+			return err
+		}
+		return d.message.Term()
+	})
+}
+
 var _ queue.Backend[int] = (*Backend[int])(nil)
 
 func validateSubjects(patterns []string, subject, scheduleSubject string) error {
 	if !coveredBy(patterns, subject) {
 		return fmt.Errorf("NATS stream does not cover queue subject %q", subject)
 	}
-	if !coveredBy(patterns, scheduleSubject+".probe") {
+	if scheduleSubject != "" && !coveredBy(patterns, scheduleSubject+".probe") {
 		return fmt.Errorf("NATS stream does not cover schedule subject %q", scheduleSubject+".>")
 	}
 	return nil

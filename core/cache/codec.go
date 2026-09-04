@@ -41,10 +41,26 @@ type KeyEncoder[K comparable] interface {
 	EncodeKey(K) (string, error)
 }
 
+// KeyDecoder converts a persistent backend key back to its typed form.
+type KeyDecoder[K comparable] interface {
+	DecodeKey(string) (K, error)
+}
+
+// KeyCodec converts typed keys in both directions.
+type KeyCodec[K comparable] interface {
+	KeyEncoder[K]
+	KeyDecoder[K]
+}
+
 // StringKeyEncoder passes string keys through unchanged.
 type StringKeyEncoder struct{}
 
 func (StringKeyEncoder) EncodeKey(key string) (string, error) {
+	return key, nil
+}
+
+// DecodeKey passes string keys through unchanged.
+func (StringKeyEncoder) DecodeKey(key string) (string, error) {
 	return key, nil
 }
 
@@ -58,4 +74,15 @@ func (JSONKeyEncoder[K]) EncodeKey(key K) (string, error) {
 		return "", err
 	}
 	return base64.RawURLEncoding.EncodeToString(data), nil
+}
+
+// DecodeKey reverses the JSON and base64 encoding applied by EncodeKey.
+func (JSONKeyEncoder[K]) DecodeKey(key string) (K, error) {
+	var value K
+	data, err := base64.RawURLEncoding.DecodeString(key)
+	if err != nil {
+		return value, err
+	}
+	err = json.Unmarshal(data, &value)
+	return value, err
 }

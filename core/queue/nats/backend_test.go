@@ -1,10 +1,13 @@
 package nats
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
+	natsgo "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/retailcrm/mg-transport-core/v2/core/logger"
 	corenats "github.com/retailcrm/mg-transport-core/v2/core/nats"
@@ -13,7 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestBackendLifecycleAndScheduling(t *testing.T) {
+func startServer(t *testing.T) *corenats.Client {
+	t.Helper()
 	srv, err := server.NewServer(&server.Options{JetStream: true, StoreDir: t.TempDir(), Port: -1})
 	require.NoError(t, err)
 	srv.Start()
@@ -23,10 +27,17 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	client, err := corenats.Connect(t.Context(), corenats.Config{URLs: []string{srv.ClientURL()}}, logger.NewNil())
 	require.NoError(t, err)
 	t.Cleanup(client.Close)
+	return client
+}
+
+func TestBackendLifecycleAndScheduling(t *testing.T) {
+	client := startServer(t)
 
 	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
 		Subject: "jobs.ready", ScheduleSubject: "jobs.schedule", Provision: Ensure,
-		Stream:       jetstream.StreamConfig{Name: "JOBS", Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy},
+		Stream: jetstream.StreamConfig{
+			Name: "JOBS", Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
+		},
 		Consumer:     jetstream.ConsumerConfig{Name: "workers", AckWait: 100 * time.Millisecond},
 		FetchMaxWait: 20 * time.Millisecond,
 	})
@@ -64,3 +75,156 @@ func TestBackendLifecycleAndScheduling(t *testing.T) {
 	})
 	require.NoError(t, err)
 }
+
+func TestRawPayloadAndDisabledScheduling(t *testing.T) {
+	client := startServer(t)
+	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+		Subject: "legacy.task.outbound.42", PayloadMode: PayloadRaw, DisableScheduling: true, Provision: Ensure,
+		Stream: jetstream.StreamConfig{
+			Name: "LEGACY_TASKS", Subjects: []string{"legacy.task.>"},
+			Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
+		},
+		Consumer: jetstream.ConsumerConfig{Name: "legacy_outbound_42"}, FetchMaxWait: 20 * time.Millisecond,
+	})
+	require.NoError(t, err)
+
+	message := natsgo.NewMsg("legacy.task.outbound.42")
+	message.Data = []byte(`"already queued"`)
+	message.Header.Set(jetstream.MsgIDHeader, "legacy-id")
+	_, err = client.JetStream.PublishMsg(t.Context(), message)
+	require.NoError(t, err)
+
+	delivery, err := backend.Dequeue(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "already queued", delivery.Value())
+	assert.Equal(t, "legacy-id", delivery.Metadata().ID)
+	assert.False(t, delivery.Metadata().EnqueuedAt.IsZero())
+	require.NoError(t, delivery.Requeue(t.Context(), 10*time.Millisecond))
+	delivery, err = backend.Dequeue(t.Context())
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, delivery.Metadata().Attempt, uint64(2))
+	require.NoError(t, delivery.Ack(t.Context()))
+
+	q := queue.New(42, backend)
+	err = q.Enqueue(t.Context(), "delayed", queue.WithDelay(time.Second))
+	require.ErrorIs(t, err, queue.ErrSchedulingUnsupported)
+	require.NoError(t, q.Enqueue(t.Context(), "direct", queue.WithID("direct-id")))
+	delivery, err = q.Dequeue(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "direct", delivery.Value())
+	assert.Equal(t, "direct-id", delivery.Metadata().ID)
+	require.NoError(t, delivery.Ack(t.Context()))
+
+	stats, err := q.Stats(t.Context())
+	require.NoError(t, err)
+	assert.Zero(t, stats.Deferred)
+}
+
+func TestDeadLetterMalformedAndRejectedDeliveries(t *testing.T) {
+	client := startServer(t)
+	dlqSubscription, err := client.Conn.SubscribeSync("legacy.dlq.outbound.42")
+	require.NoError(t, err)
+	require.NoError(t, client.Conn.Flush())
+
+	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+		Subject: "legacy.task.outbound.42", PayloadMode: PayloadRaw, DisableScheduling: true, Provision: Ensure,
+		Stream: jetstream.StreamConfig{
+			Name: "LEGACY_TASKS_DLQ_TEST", Subjects: []string{"legacy.task.>"},
+			Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
+		},
+		Consumer: jetstream.ConsumerConfig{Name: "legacy_dlq_outbound_42"}, FetchMaxWait: 20 * time.Millisecond,
+		DeadLetter: &DeadLetterConfig{
+			Subject: "legacy.dlq.outbound.42",
+			Stream: jetstream.StreamConfig{
+				Name: "LEGACY_DLQ", Subjects: []string{"legacy.dlq.>"}, Storage: jetstream.MemoryStorage,
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	malformed := natsgo.NewMsg("legacy.task.outbound.42")
+	malformed.Data = []byte("not JSON")
+	malformed.Header.Set("Original", "header")
+	_, err = client.JetStream.PublishMsg(t.Context(), malformed)
+	require.NoError(t, err)
+	_, err = backend.Dequeue(t.Context())
+	require.ErrorContains(t, err, "decode NATS delivery")
+	deadLetter := nextMessage(t, dlqSubscription)
+	assert.Equal(t, malformed.Data, deadLetter.Data)
+	assert.Equal(t, "header", deadLetter.Header.Get("Original"))
+	assert.Equal(t, malformed.Subject, deadLetter.Header.Get("X-Original-Subject"))
+	assert.Contains(t, deadLetter.Header.Get("X-Error"), "decode NATS delivery")
+
+	q := queue.New(42, backend)
+	require.NoError(t, q.Enqueue(t.Context(), "valid", queue.WithID("valid-id")))
+	delivery, err := q.Dequeue(t.Context())
+	require.NoError(t, err)
+	cause := errors.New("permanent transport error")
+	require.NoError(t, queue.DeadLetter(t.Context(), delivery, cause))
+	deadLetter = nextMessage(t, dlqSubscription)
+	assert.Equal(t, `"valid"`, string(deadLetter.Data))
+	assert.Equal(t, cause.Error(), deadLetter.Header.Get("X-Error"))
+	require.ErrorIs(t, delivery.Ack(t.Context()), queue.ErrDeliverySettled)
+
+	_, err = New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+		Subject: "legacy.task.outbound.42", PayloadMode: PayloadRaw,
+		DisableScheduling: true, Provision: BindExisting,
+		Stream:   jetstream.StreamConfig{Name: "LEGACY_TASKS_DLQ_TEST"},
+		Consumer: jetstream.ConsumerConfig{Name: "legacy_dlq_outbound_42"},
+		DeadLetter: &DeadLetterConfig{
+			Subject: "legacy.dlq.outbound.42",
+			Stream:  jetstream.StreamConfig{Name: "LEGACY_DLQ"},
+		},
+	})
+	require.NoError(t, err)
+}
+
+func TestFailedDeadLetterDoesNotSettleDelivery(t *testing.T) {
+	client := startServer(t)
+	backend, err := New(t.Context(), client, queue.JSONCodec[string]{}, Config{
+		Subject: "failed.task", DisableScheduling: true, Provision: Ensure,
+		Stream: jetstream.StreamConfig{
+			Name: "FAILED_TASK", Storage: jetstream.MemoryStorage, Retention: jetstream.WorkQueuePolicy,
+		},
+		Consumer: jetstream.ConsumerConfig{Name: "failed_worker"},
+		DeadLetter: &DeadLetterConfig{
+			Subject: "failed.dlq",
+			Stream:  jetstream.StreamConfig{Name: "FAILED_DLQ", Storage: jetstream.MemoryStorage},
+		},
+	})
+	require.NoError(t, err)
+	q := queue.New(1, backend)
+	require.NoError(t, q.Enqueue(t.Context(), "payload"))
+	delivery, err := q.Dequeue(t.Context())
+	require.NoError(t, err)
+
+	canceled, cancel := context.WithCancel(t.Context())
+	cancel()
+	err = queue.DeadLetter(canceled, delivery, errors.New("failed"))
+	require.ErrorIs(t, err, context.Canceled)
+	assert.False(t, delivery.Settled())
+	require.NoError(t, delivery.Ack(t.Context()))
+}
+
+func TestDeadLetterUnsupported(t *testing.T) {
+	delivery := &unsupportedDeadLetterDelivery{}
+	err := queue.DeadLetter(t.Context(), delivery, errors.New("failed"))
+	require.ErrorIs(t, err, queue.ErrDeadLetterUnsupported)
+}
+
+func nextMessage(t *testing.T, subscription *natsgo.Subscription) *natsgo.Msg {
+	t.Helper()
+	message, err := subscription.NextMsg(time.Second)
+	require.NoError(t, err)
+	return message
+}
+
+type unsupportedDeadLetterDelivery struct{}
+
+func (*unsupportedDeadLetterDelivery) Value() string                                { return "" }
+func (*unsupportedDeadLetterDelivery) Metadata() queue.Metadata                     { return queue.Metadata{} }
+func (*unsupportedDeadLetterDelivery) Ack(context.Context) error                    { return nil }
+func (*unsupportedDeadLetterDelivery) Requeue(context.Context, time.Duration) error { return nil }
+func (*unsupportedDeadLetterDelivery) Reject(context.Context) error                 { return nil }
+func (*unsupportedDeadLetterDelivery) Touch(context.Context) error                  { return nil }
+func (*unsupportedDeadLetterDelivery) Settled() bool                                { return false }
